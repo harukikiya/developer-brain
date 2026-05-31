@@ -120,6 +120,13 @@ impl LanguageServer for Backend {
                 code_lens_provider: Some(CodeLensOptions {
                     resolve_provider: Some(false),
                 }),
+                // カスタムコマンド。エディタ側が "dbrain/graph" を呼ぶとグラフ JSON を返す。
+                // workspace/executeCommand は LSP 標準の拡張メカニズムで、
+                // コマンド名だけ登録しておけばエディタから任意に呼び出せる。
+                execute_command_provider: Some(ExecuteCommandOptions {
+                    commands: vec!["dbrain/graph".to_string()],
+                    work_done_progress_options: Default::default(),
+                }),
                 ..Default::default()
             },
         })
@@ -471,6 +478,35 @@ impl LanguageServer for Backend {
         } else {
             Some(lenses)
         })
+    }
+
+    // --- カスタムコマンド（3-1） ---
+    //
+    // `workspace/executeCommand` は LSP 標準の拡張メカニズム。
+    // エディタ側（TypeScript）が `client.sendRequest(ExecuteCommandRequest.type, ...)`
+    // を呼ぶと、ここに届く。コアの知識グラフを JSON として返す。
+    //
+    // なぜ CLI を叩かないのか？
+    // M2 で LSP サーバが索引をメモリに保持するようになったため、
+    // 再度ファイルを走査せずに即答できる。CLI 実行だと毎回数秒かかる。
+
+    async fn execute_command(
+        &self,
+        params: ExecuteCommandParams,
+    ) -> Result<Option<serde_json::Value>> {
+        if params.command == "dbrain/graph" {
+            let s = self.state.read().await;
+            let json_str = match &s.index {
+                Some(index) => index.graph.to_json_string(),
+                // 索引がまだ完成していなければ空グラフを返す（エディタ側で再試行可）。
+                None => r#"{"nodes":[],"edges":[]}"#.to_string(),
+            };
+            // to_json_string() が生成した文字列を Value に戻す。
+            // unwrap_or はコア側のバグ防護——正常系では失敗しない。
+            let value = serde_json::from_str(&json_str).unwrap_or(serde_json::Value::Null);
+            return Ok(Some(value));
+        }
+        Ok(None)
     }
 }
 

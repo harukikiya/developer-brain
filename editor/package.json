@@ -25,12 +25,14 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "compile": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node",
+    "compile": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node && esbuild src/graph-view.ts --bundle --outfile=dist/graph-view.js --format=iife --platform=browser",
     "build": "npm run typecheck && npm run compile"
   },
   "devDependencies": {
+    "@types/cytoscape": "^3.21.4",
     "@types/node": "^20.11.0",
     "@types/vscode": "^1.85.0",
+    "cytoscape": "^3.30.2",
     "esbuild": "^0.21.5",
     "typescript": "^5.4.5"
   },
