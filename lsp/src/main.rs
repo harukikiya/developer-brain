@@ -101,8 +101,16 @@ impl LanguageServer for Backend {
                 version: Some(env!("CARGO_PKG_VERSION").to_string()),
             }),
             capabilities: ServerCapabilities {
-                text_document_sync: Some(TextDocumentSyncCapability::Kind(
-                    TextDocumentSyncKind::FULL,
+                // 単なる同期種別(Kind)ではなく Options を使うのは、保存通知(did_save)を
+                // 受け取りたいから。Kind だけだと save 通知は届かない。
+                // include_text=false: 保存時にファイル全文は不要（ディスクから読み直すため）。
+                text_document_sync: Some(TextDocumentSyncCapability::Options(
+                    TextDocumentSyncOptions {
+                        open_close: Some(true),
+                        change: Some(TextDocumentSyncKind::FULL),
+                        save: Some(TextDocumentSyncSaveOptions::Supported(true)),
+                        ..Default::default()
+                    },
                 )),
                 document_link_provider: Some(DocumentLinkOptions {
                     resolve_provider: Some(false),
@@ -141,51 +149,8 @@ impl LanguageServer for Backend {
             .log_message(MessageType::INFO, "developer-brain-lsp initialized")
             .await;
 
-        let root = {
-            let s = self.state.read().await;
-            s.root.clone()
-        };
-
-        if let Some(root) = root {
-            let state_arc = Arc::clone(&self.state);
-            let client = self.client.clone();
-
-            tokio::spawn(async move {
-                client
-                    .log_message(MessageType::INFO, "developer-brain: indexing workspace...")
-                    .await;
-
-                let result = tokio::task::spawn_blocking(move || index_workspace(&root)).await;
-
-                match result {
-                    Ok(index) => {
-                        let msg = format!(
-                            "developer-brain: indexed {} nodes, {} edges",
-                            index.graph.node_count(),
-                            index.graph.edge_count(),
-                        );
-                        let open_uris: Vec<Url> = {
-                            let mut s = state_arc.write().await;
-                            let uris = s.docs.keys().cloned().collect();
-                            s.index = Some(index);
-                            uris
-                        };
-                        client.log_message(MessageType::INFO, msg).await;
-                        for uri in open_uris {
-                            push_diagnostics(&uri, &state_arc, &client).await;
-                        }
-                    }
-                    Err(e) => {
-                        client
-                            .log_message(
-                                MessageType::ERROR,
-                                format!("developer-brain: indexing failed: {e}"),
-                            )
-                            .await;
-                    }
-                }
-            });
-        }
+        // 起動直後にバックグラウンドで初回索引を構築する。
+        tokio::spawn(reindex(Arc::clone(&self.state), self.client.clone()));
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -219,6 +184,15 @@ impl LanguageServer for Backend {
         self.client
             .publish_diagnostics(params.text_document.uri, vec![], None)
             .await;
+    }
+
+    // --- 増分更新（M4 4-1）: 保存時に再索引する ---
+    //
+    // タイプ中（did_change）はバッファ更新＋当該ドキュメントの診断のみで、索引は
+    // 更新しない。保存時はディスクが最新になるので、ここで索引を作り直し、
+    // シンボルの増減やリンク解決の変化を全ドキュメントの診断に反映する。
+    async fn did_save(&self, _params: DidSaveTextDocumentParams) {
+        tokio::spawn(reindex(Arc::clone(&self.state), self.client.clone()));
     }
 
     // --- DocumentLink（2-3） ---
@@ -541,6 +515,65 @@ impl LanguageServer for Backend {
             }
 
             _ => Ok(None),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 再索引（M4 4-1）
+// ---------------------------------------------------------------------------
+
+/// ワークスペースを索引し直し、結果を state に格納して全ドキュメントの診断を更新する。
+///
+/// 起動時（initialized）と保存時（did_save）の両方から呼ばれる共通処理。
+/// `index_workspace` は CPU バウンドな同期処理なので `spawn_blocking` で
+/// 非同期エグゼキュータをブロックしないようにする。
+///
+/// 所有権を引数で受け取る（参照ではない）のは、`tokio::spawn` に渡して
+/// バックグラウンド実行するため。`Arc` と `Client` はどちらも安価に clone できる。
+async fn reindex(state: Arc<RwLock<State>>, client: Client) {
+    let root = {
+        let s = state.read().await;
+        s.root.clone()
+    };
+    let Some(root) = root else {
+        return;
+    };
+
+    client
+        .log_message(MessageType::INFO, "developer-brain: indexing workspace...")
+        .await;
+
+    let result = tokio::task::spawn_blocking(move || index_workspace(&root)).await;
+
+    match result {
+        Ok(index) => {
+            let msg = format!(
+                "developer-brain: indexed {} nodes, {} edges",
+                index.graph.node_count(),
+                index.graph.edge_count(),
+            );
+            // 索引を差し替えてから、開いている全ドキュメントの診断を更新する。
+            // シンボルの増減やリンク解決の変化が、編集していないファイルの
+            // 波線にも反映される（これが M4 の主目的）。
+            let open_uris: Vec<Url> = {
+                let mut s = state.write().await;
+                let uris = s.docs.keys().cloned().collect();
+                s.index = Some(index);
+                uris
+            };
+            client.log_message(MessageType::INFO, msg).await;
+            for uri in open_uris {
+                push_diagnostics(&uri, &state, &client).await;
+            }
+        }
+        Err(e) => {
+            client
+                .log_message(
+                    MessageType::ERROR,
+                    format!("developer-brain: indexing failed: {e}"),
+                )
+                .await;
         }
     }
 }
