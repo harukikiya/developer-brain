@@ -108,11 +108,14 @@ async function showGraphView(context: ExtensionContext): Promise<void> {
       graphPanel = undefined;
     });
 
-    // Webview から届くメッセージを処理する（3-4: ノードクリック）。
+    // Webview から届くメッセージを処理する。
     graphPanel.webview.onDidReceiveMessage(
       async (msg: { type: string; id: string; kind: string }) => {
         if (msg.type === "nodeClick") {
           await handleNodeClick(msg.id, msg.kind);
+        } else if (msg.type === "refresh") {
+          // 更新ボタンが押されたら最新のグラフを再取得して送り直す。
+          await fetchAndSendGraph();
         }
       }
     );
@@ -125,8 +128,16 @@ async function showGraphView(context: ExtensionContext): Promise<void> {
     graphPanel.webview.html = buildWebviewHtml(scriptUri);
   }
 
-  // LSP サーバに問い合わせてグラフ JSON を取得する。
-  // まだ索引が完成していなければ空グラフが返る。
+  await fetchAndSendGraph();
+}
+
+/**
+ * LSP からグラフ JSON を取得して Webview に送る。
+ * showGraphView の初回表示と、更新ボタン押下（"refresh" メッセージ）の両方で使う。
+ */
+async function fetchAndSendGraph(): Promise<void> {
+  if (!graphPanel) return;
+
   let graphData: unknown = { nodes: [], edges: [] };
   if (client) {
     try {
@@ -141,8 +152,7 @@ async function showGraphView(context: ExtensionContext): Promise<void> {
     }
   }
 
-  // Webview に JSON を送る。
-  void graphPanel?.webview.postMessage({ type: "graph", data: graphData });
+  void graphPanel.webview.postMessage({ type: "graph", data: graphData });
 }
 
 /**
@@ -175,46 +185,67 @@ function buildWebviewHtml(scriptUri: Uri): string {
     #toolbar {
       display: flex;
       align-items: center;
-      gap: 12px;
-      padding: 6px 12px;
+      gap: 8px;
+      padding: 5px 10px;
       background: var(--vscode-sideBar-background);
       border-bottom: 1px solid var(--vscode-panel-border);
       flex-shrink: 0;
       flex-wrap: wrap;
-    }
-    #status {
       font-size: 12px;
+    }
+    .filter-group { display: flex; align-items: center; gap: 5px; }
+    .filter-group label { display: flex; align-items: center; gap: 3px; cursor: pointer; }
+    .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+    .sep { width: 1px; height: 14px; background: var(--vscode-panel-border); margin: 0 2px; }
+    button {
+      background: var(--vscode-button-secondaryBackground, #3a3d41);
+      color: var(--vscode-button-secondaryForeground, #ccc);
+      border: none; padding: 2px 7px; cursor: pointer;
+      border-radius: 2px; font-size: 11px;
+    }
+    button:hover { background: var(--vscode-button-secondaryHoverBackground, #4a4d51); }
+    #status {
+      font-size: 11px;
       color: var(--vscode-descriptionForeground);
       margin-left: auto;
     }
-    .filter-group { display: flex; align-items: center; gap: 6px; font-size: 12px; }
-    .filter-group label { display: flex; align-items: center; gap: 4px; cursor: pointer; }
-    .dot {
-      width: 10px; height: 10px; border-radius: 50%; display: inline-block;
-    }
-    #cy {
-      flex: 1;
-      width: 100%;
-    }
-    #loading {
-      position: absolute;
-      top: 50%;
-      left: 50%;
-      transform: translate(-50%, -50%);
-      font-size: 14px;
-      color: var(--vscode-descriptionForeground);
-    }
+    #cy { flex: 1; width: 100%; }
   </style>
 </head>
 <body>
   <div id="toolbar">
-    <span style="font-weight:600;font-size:13px;">Knowledge Graph</span>
+    <span style="font-weight:600;font-size:12px;">Knowledge Graph</span>
+    <div class="sep"></div>
+    <!-- ノード種別フィルタ。section はデフォルト非表示（contains と対で多量のノイズになるため）。 -->
     <div class="filter-group">
-      <label><input type="checkbox" data-kind="doc"     checked> <span class="dot" style="background:#4A90D9"></span> doc</label>
-      <label><input type="checkbox" data-kind="section" checked> <span class="dot" style="background:#7EC8E3"></span> section</label>
-      <label><input type="checkbox" data-kind="symbol"  checked> <span class="dot" style="background:#E8824A"></span> symbol</label>
-      <label><input type="checkbox" data-kind="term"    checked> <span class="dot" style="background:#7DBD77"></span> term</label>
+      <label title="Markdown ドキュメント">
+        <input type="checkbox" data-kind="doc" checked>
+        <span class="dot" style="background:#4A90D9"></span> doc
+      </label>
+      <label title="ドキュメント内の見出し（section + contains は多量なためデフォルト非表示）">
+        <input type="checkbox" data-kind="section">
+        <span class="dot" style="background:#7EC8E3"></span> section
+      </label>
+      <label title="コードシンボル（関数・型・定数など）">
+        <input type="checkbox" data-kind="symbol" checked>
+        <span class="dot" style="background:#E8824A"></span> symbol
+      </label>
+      <label title="用語集エントリ">
+        <input type="checkbox" data-kind="term" checked>
+        <span class="dot" style="background:#7DBD77"></span> term
+      </label>
     </div>
+    <div class="sep"></div>
+    <!-- 辺種別フィルタ。contains はデフォルト非表示。 -->
+    <div class="filter-group">
+      <label title="doc → doc のリンク"><input type="checkbox" data-edge-kind="links" checked> links</label>
+      <label title="doc → symbol の参照"><input type="checkbox" data-edge-kind="references" checked> refs</label>
+      <label title="doc → section の包含（section と合わせて表示）"><input type="checkbox" data-edge-kind="contains"> contains</label>
+      <label title="用語の出現"><input type="checkbox" data-edge-kind="mentions" checked> mentions</label>
+    </div>
+    <div class="sep"></div>
+    <button id="fit-btn" title="グラフ全体をビューに収める">⊡ Fit</button>
+    <button id="refresh-btn" title="索引を再取得して再描画する">↺ 更新</button>
     <span id="status">読み込み中…</span>
   </div>
   <div id="cy"></div>

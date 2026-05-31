@@ -2,22 +2,18 @@
 // Developer Brain — グラフビュー（Webview 内スクリプト）
 // =============================================================================
 //
-// このファイルは VS Code Webview の中で動く。通常の Web ページとほぼ同じだが、
-// VS Code との通信は window.addEventListener("message", ...) で行う。
+// VS Code Webview の中で動く。extension.ts との通信は postMessage / onmessage。
 //
-// データの流れ:
-//   extension.ts → postMessage({type:"graph", data: GraphJson})
-//     → ここで受け取り → Cytoscape でレンダリング
+// データの流れ（受信）:
+//   extension.ts → postMessage({type:"graph", data: GraphJson}) → renderGraph()
 //
-// 3-2: まず <pre> にデータをそのまま表示して配管を確認する（描画は 3-3）。
-// 3-3: Cytoscape.js でグラフを描く。
-// 3-4: クリックジャンプ + ノード種別フィルタ。
+// データの流れ（送信）:
+//   ノードクリック → postMessage({type:"nodeClick", id, kind})
+//   更新ボタン    → postMessage({type:"refresh"})
 // =============================================================================
 
 import cytoscape from "cytoscape";
 
-// VS Code の Webview API（postMessage / setState 等）。
-// `acquireVsCodeApi` は Webview 環境でのみ存在するグローバル関数。
 declare function acquireVsCodeApi(): {
   postMessage(message: unknown): void;
   setState(state: unknown): void;
@@ -46,30 +42,34 @@ interface GraphJson {
 }
 
 // --------------------------------------------------------------------------
-// メッセージ受信と描画
+// 初期化
 // --------------------------------------------------------------------------
 
 const vscode = acquireVsCodeApi();
-
-// グラフが届くまでローディング表示。
 const container = document.getElementById("cy");
-const status = document.getElementById("status");
+const statusEl = document.getElementById("status");
+
+// レンダリング後にフィルタや Fit ボタンがアクセスできるよう
+// モジュールスコープに保持する。
+let cy: cytoscape.Core | null = null;
+
+// --------------------------------------------------------------------------
+// メッセージ受信
+// --------------------------------------------------------------------------
 
 window.addEventListener("message", (event: MessageEvent) => {
   const msg = event.data as { type: string; data: GraphJson };
   if (msg.type !== "graph") return;
 
   const graph = msg.data;
-
-  if (status) {
-    status.textContent = `${graph.nodes.length} ノード / ${graph.edges.length} 辺`;
+  if (statusEl) {
+    statusEl.textContent = `${graph.nodes.length} ノード / ${graph.edges.length} 辺`;
   }
-
   renderGraph(graph);
 });
 
 // --------------------------------------------------------------------------
-// Cytoscape レンダリング（3-3）
+// Cytoscape レンダリング
 // --------------------------------------------------------------------------
 
 /** ノード種別に対応する背景色 */
@@ -83,34 +83,28 @@ const NODE_COLORS: Record<GraphNode["kind"], string> = {
 function renderGraph(graph: GraphJson): void {
   if (!container) return;
 
-  // 既存のインスタンスがあれば破棄して作り直す（再描画）。
+  // 既存インスタンスを破棄してから作り直す（更新時の二重描画を防ぐ）。
+  if (cy) {
+    cy.destroy();
+    cy = null;
+  }
   container.innerHTML = "";
 
-  cytoscape({
+  cy = cytoscape({
     container,
-
-    // ノードと辺のデータ。Cytoscape は {data: {...}} 形式で受け取る。
     elements: [
       ...graph.nodes.map((n) => ({
         data: { id: n.id, label: n.label, kind: n.kind },
       })),
       ...graph.edges.map((e, i) => ({
-        data: {
-          id: `edge-${i}`,
-          source: e.from,
-          target: e.to,
-          kind: e.kind,
-        },
+        data: { id: `edge-${i}`, source: e.from, target: e.to, kind: e.kind },
       })),
     ],
-
-    // スタイル定義。
     style: [
       {
         selector: "node",
         style: {
           label: "data(label)",
-          // ノード種別で色分けする。
           "background-color": (ele: cytoscape.NodeSingular) =>
             NODE_COLORS[ele.data("kind") as GraphNode["kind"]] ?? "#aaa",
           color: "#fff",
@@ -141,24 +135,111 @@ function renderGraph(graph: GraphJson): void {
         selector: "edge[kind='contains']",
         style: { "line-style": "dashed", width: 1, "line-color": "#ccc" },
       },
-      // ホバー・選択時のハイライト。
       {
         selector: "node:selected",
         style: { "border-width": 3, "border-color": "#fff" },
       },
     ],
-
-    // Cola / cose 等のレイアウト。section は親 doc のそばに置きたいが、
-    // シンプルな `cose`（force-directed）で十分見やすい。
     layout: {
       name: "cose",
-      animate: false,
+      animate: false,       // 大きいグラフでもアニメなしで即表示
       nodeRepulsion: () => 4096,
       padding: 20,
     },
-  }).on("tap", "node", (evt: cytoscape.EventObject) => {
-    // ノードをクリックしたら extension.ts へ通知する（3-4: 定義ジャンプ）。
+    // ズームアウト時に辺を省略して描画負荷を下げる。
+    // ノードが多いワークスペースで有効。
+    hideEdgesOnViewport: true,
+    textureOnViewport: true,
+  });
+
+  cy.on("tap", "node", (evt: cytoscape.EventObject) => {
     const node = evt.target as cytoscape.NodeSingular;
     vscode.postMessage({ type: "nodeClick", id: node.id(), kind: node.data("kind") });
+  });
+
+  // レイアウト完了後にデフォルトフィルタを適用してビューに収める。
+  applyVisibility(cy);
+  cy.fit(undefined, 20);
+
+  // コントロールを初回のみ接続する（再描画のたびに重複登録しないよう once フラグ管理）。
+  if (!controlsAttached) {
+    attachControls();
+    controlsAttached = true;
+  }
+}
+
+// --------------------------------------------------------------------------
+// フィルタ（表示/非表示の管理）
+// --------------------------------------------------------------------------
+
+// @types/cytoscape の特定バージョンでは NodeCollection / EdgeCollection 上の
+// show() / hide() / hidden() の型定義が欠落しているため、
+// 中間型 Visible にキャストして呼び出す。実行時の動作は正常。
+type Visible = { show(): void; hide(): void; hidden(): boolean };
+const vis = (x: unknown): Visible => x as Visible;
+
+/**
+ * ツールバーのチェックボックス状態を読んで、ノードと辺の表示を更新する。
+ *
+ * 手順:
+ *   1. 全要素を一旦表示（show）
+ *   2. 非表示ノード種別のノードを hide
+ *   3. 非表示辺種別の辺を hide
+ *   4. 片端が非表示ノードである辺も hide（宙吊り辺を消す）
+ */
+function applyVisibility(instance: cytoscape.Core): void {
+  vis(instance.elements()).show();
+
+  // ノード種別フィルタ
+  document
+    .querySelectorAll<HTMLInputElement>("input[data-kind]")
+    .forEach((cb) => {
+      if (!cb.checked) {
+        vis(instance.nodes(`[kind = "${cb.dataset.kind}"]`)).hide();
+      }
+    });
+
+  // 辺種別フィルタ
+  document
+    .querySelectorAll<HTMLInputElement>("input[data-edge-kind]")
+    .forEach((cb) => {
+      if (!cb.checked) {
+        vis(instance.edges(`[kind = "${cb.dataset.edgeKind}"]`)).hide();
+      }
+    });
+
+  // 片端が非表示のノードである辺は自動的には消えないので明示的に hide する。
+  instance.edges().forEach((edge) => {
+    if (vis(edge.source()).hidden() || vis(edge.target()).hidden()) {
+      vis(edge).hide();
+    }
+  });
+}
+
+// --------------------------------------------------------------------------
+// コントロール（ボタン + チェックボックス）のイベント接続
+// --------------------------------------------------------------------------
+
+let controlsAttached = false;
+
+function attachControls(): void {
+  // ノード/辺種別チェックボックス変更 → フィルタ再適用
+  document
+    .querySelectorAll<HTMLInputElement>("input[data-kind], input[data-edge-kind]")
+    .forEach((cb) => {
+      cb.addEventListener("change", () => {
+        if (cy) applyVisibility(cy);
+      });
+    });
+
+  // Fit ボタン → グラフ全体がビューに収まるよう再フィット
+  document.getElementById("fit-btn")?.addEventListener("click", () => {
+    cy?.fit(undefined, 20);
+  });
+
+  // 更新ボタン → extension.ts に再取得を依頼する
+  document.getElementById("refresh-btn")?.addEventListener("click", () => {
+    if (statusEl) statusEl.textContent = "更新中…";
+    vscode.postMessage({ type: "refresh" });
   });
 }
