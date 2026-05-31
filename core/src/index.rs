@@ -506,7 +506,8 @@ mod tests {
         assert_eq!(all.len(), 2);
         // 2 個目を覆うコード範囲を渡すと 1 件に減る。
         let idx = text.find("[[two.md]]").unwrap();
-        let masked = extract_wikilinks(text, &[idx..idx + 10]);
+        let r = idx..idx + 10;
+        let masked = extract_wikilinks(text, std::slice::from_ref(&r));
         assert_eq!(masked.len(), 1);
     }
 
