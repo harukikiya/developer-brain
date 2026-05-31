@@ -26,17 +26,17 @@ fn main() -> ExitCode {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from(".")); // 省略時はカレント。
 
-            let graph = dbrain_core::index::index_workspace(&dir);
+            let idx = dbrain_core::index::index_workspace(&dir);
 
             // 人間向けの進捗は stderr、機械可読データ(JSON)は stdout に分ける。
             eprintln!(
                 "[dbrain] {} nodes, {} edges (コード参照: 解決 {} / 未解決 {})",
-                graph.node_count(),
-                graph.edge_count(),
-                graph.code_refs_resolved,
-                graph.code_refs_unresolved
+                idx.graph.node_count(),
+                idx.graph.edge_count(),
+                idx.graph.code_refs_resolved,
+                idx.graph.code_refs_unresolved
             );
-            println!("{}", graph.to_json_string());
+            println!("{}", idx.graph.to_json_string());
             ExitCode::SUCCESS
         }
         // 使い方が分からない入力には usage を出して、非ゼロ終了する
