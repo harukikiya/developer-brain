@@ -223,23 +223,43 @@ function applyVisibility(instance: cytoscape.Core): void {
 let controlsAttached = false;
 
 function attachControls(): void {
-  // ノード/辺種別チェックボックス変更 → フィルタ再適用
+  // section 以外のノード種別 + 辺種別チェックボックス → client-side フィルタ
+  //（再取得不要。状態はメモリ上に保持されているため即座に反映できる）
   document
-    .querySelectorAll<HTMLInputElement>("input[data-kind], input[data-edge-kind]")
+    .querySelectorAll<HTMLInputElement>(
+      "input[data-kind]:not([data-kind='section']), input[data-edge-kind]"
+    )
     .forEach((cb) => {
       cb.addEventListener("change", () => {
         if (cy) applyVisibility(cy);
       });
     });
 
-  // Fit ボタン → グラフ全体がビューに収まるよう再フィット
+  // section チェックボックスは特別扱い。
+  //   ON  → sections を含むグラフを再取得（デフォルトでは送られてこないため）。
+  //   OFF → client-side hide で済ませる（ラウンドトリップなし）。
+  const sectionCb = document.querySelector<HTMLInputElement>(
+    "input[data-kind='section']"
+  );
+  sectionCb?.addEventListener("change", () => {
+    if (sectionCb.checked) {
+      if (statusEl) statusEl.textContent = "セクション読み込み中…";
+      vscode.postMessage({ type: "sectionChange", include: true });
+    } else {
+      if (cy) applyVisibility(cy);
+    }
+  });
+
+  // Fit ボタン → グラフ全体をビューに収める
   document.getElementById("fit-btn")?.addEventListener("click", () => {
     cy?.fit(undefined, 20);
   });
 
-  // 更新ボタン → extension.ts に再取得を依頼する
+  // 更新ボタン → section の現在状態を引き継いで extension.ts に再取得を依頼する。
+  // section が ON のまま更新しても sections 込みのグラフが返る。
   document.getElementById("refresh-btn")?.addEventListener("click", () => {
     if (statusEl) statusEl.textContent = "更新中…";
-    vscode.postMessage({ type: "refresh" });
+    const includeSections = sectionCb?.checked ?? false;
+    vscode.postMessage({ type: "refresh", includeSections });
   });
 }

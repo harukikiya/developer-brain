@@ -221,18 +221,29 @@ impl KnowledgeGraph {
     ///
     /// 内部の `NodeId` enum をそのまま出すと扱いにくいので、フラットな
     /// 文字列 id（例: `doc:path.md`）に整えて出力する。
-    pub fn to_json_string(&self) -> String {
+    ///
+    /// `include_sections` が `false` のとき [`NodeId::Section`] ノードと
+    /// [`Edge::Contains`] 辺を除外して出力する。doc 1 本あたり見出し数分だけ
+    /// 発生するこれらを省くと、Webview への転送コストと JS のメモリ使用量が
+    /// 大きく下がる。CLI は全量が必要なので `true` を渡す。
+    pub fn to_json_string(&self, include_sections: bool) -> String {
         let out = GraphJson {
             nodes: self
                 .nodes
                 .iter()
+                .filter(|n| include_sections || !matches!(n.id, NodeId::Section(..)))
                 .map(|n| NodeJson {
                     id: node_id_string(&n.id),
                     kind: node_kind(&n.id),
                     label: n.label.clone(),
                 })
                 .collect(),
-            edges: self.edges.iter().map(edge_json).collect(),
+            edges: self
+                .edges
+                .iter()
+                .filter(|e| include_sections || !matches!(e, Edge::Contains { .. }))
+                .map(edge_json)
+                .collect(),
         };
         serde_json::to_string(&out).unwrap_or_else(|_| "{\"nodes\":[],\"edges\":[]}".to_string())
     }
@@ -899,7 +910,7 @@ mod tests {
             from: doc,
             to: NodeId::Doc(RelPath("b.md".into())),
         });
-        let json = g.to_json_string();
+        let json = g.to_json_string(true);
         assert!(json.contains("\"id\":\"doc:a.md\""));
         assert!(json.contains("\"kind\":\"links\""));
     }
