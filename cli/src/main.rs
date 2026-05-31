@@ -36,7 +36,7 @@ fn main() -> ExitCode {
                 idx.graph.code_refs_resolved,
                 idx.graph.code_refs_unresolved
             );
-            println!("{}", idx.graph.to_json_string());
+            println!("{}", idx.graph.to_json_string(true));
             ExitCode::SUCCESS
         }
         // 使い方が分からない入力には usage を出して、非ゼロ終了する

@@ -124,7 +124,11 @@ impl LanguageServer for Backend {
                 // workspace/executeCommand は LSP 標準の拡張メカニズムで、
                 // コマンド名だけ登録しておけばエディタから任意に呼び出せる。
                 execute_command_provider: Some(ExecuteCommandOptions {
-                    commands: vec!["dbrain/graph".to_string()],
+                    commands: vec![
+                        "dbrain/graph".to_string(),
+                        // シンボル ID からファイル位置を逆引きする。Webview のジャンプに使う。
+                        "dbrain/symbolInfo".to_string(),
+                    ],
                     work_done_progress_options: Default::default(),
                 }),
                 ..Default::default()
@@ -480,33 +484,64 @@ impl LanguageServer for Backend {
         })
     }
 
-    // --- カスタムコマンド（3-1） ---
-    //
-    // `workspace/executeCommand` は LSP 標準の拡張メカニズム。
-    // エディタ側（TypeScript）が `client.sendRequest(ExecuteCommandRequest.type, ...)`
-    // を呼ぶと、ここに届く。コアの知識グラフを JSON として返す。
-    //
-    // なぜ CLI を叩かないのか？
-    // M2 で LSP サーバが索引をメモリに保持するようになったため、
-    // 再度ファイルを走査せずに即答できる。CLI 実行だと毎回数秒かかる。
+    // --- カスタムコマンド（3-1 / feature: symbol-jump + section-opt） ---
 
     async fn execute_command(
         &self,
         params: ExecuteCommandParams,
     ) -> Result<Option<serde_json::Value>> {
-        if params.command == "dbrain/graph" {
-            let s = self.state.read().await;
-            let json_str = match &s.index {
-                Some(index) => index.graph.to_json_string(),
-                // 索引がまだ完成していなければ空グラフを返す（エディタ側で再試行可）。
-                None => r#"{"nodes":[],"edges":[]}"#.to_string(),
-            };
-            // to_json_string() が生成した文字列を Value に戻す。
-            // unwrap_or はコア側のバグ防護——正常系では失敗しない。
-            let value = serde_json::from_str(&json_str).unwrap_or(serde_json::Value::Null);
-            return Ok(Some(value));
+        match params.command.as_str() {
+            // グラフ JSON を返す。
+            // 引数: [{include_sections: bool}]（省略時は false）
+            // include_sections = false にすると Section ノードと Contains 辺を除外し、
+            // 転送量と Webview の JS メモリを削減できる。CLI は true を渡す。
+            "dbrain/graph" => {
+                let include_sections = params
+                    .arguments
+                    .first()
+                    .and_then(|v| v.get("include_sections"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+
+                let s = self.state.read().await;
+                let json_str = match &s.index {
+                    Some(index) => index.graph.to_json_string(include_sections),
+                    None => r#"{"nodes":[],"edges":[]}"#.to_string(),
+                };
+                let value = serde_json::from_str(&json_str).unwrap_or(serde_json::Value::Null);
+                Ok(Some(value))
+            }
+
+            // symbol ノードのジャンプ先（ファイル・行・列）を返す。
+            // 引数: [symbolId: number]（NodeId "symbol:N" の N）
+            // Webview のノードクリックで symbol ジャンプに使う。
+            "dbrain/symbolInfo" => {
+                let sym_id = params
+                    .arguments
+                    .first()
+                    .and_then(|v| v.as_u64())
+                    .map(|n| dbrain_core::model::SymbolId(n as u32));
+
+                let Some(id) = sym_id else {
+                    return Ok(None);
+                };
+                let s = self.state.read().await;
+                let Some(index) = &s.index else {
+                    return Ok(None);
+                };
+                let Some(entry) = index.symbols.get(id) else {
+                    return Ok(None);
+                };
+
+                Ok(Some(serde_json::json!({
+                    "file": entry.descriptor.file.0,
+                    "line": entry.name_range.start.line,
+                    "character": entry.name_range.start.character,
+                })))
+            }
+
+            _ => Ok(None),
         }
-        Ok(None)
     }
 }
 

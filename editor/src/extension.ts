@@ -12,6 +12,8 @@
 import * as path from "path";
 import {
   ExtensionContext,
+  Position,
+  Range,
   Uri,
   ViewColumn,
   WebviewPanel,
@@ -110,12 +112,21 @@ async function showGraphView(context: ExtensionContext): Promise<void> {
 
     // Webview から届くメッセージを処理する。
     graphPanel.webview.onDidReceiveMessage(
-      async (msg: { type: string; id: string; kind: string }) => {
+      async (msg: {
+        type: string;
+        id: string;
+        kind: string;
+        include?: boolean;
+        includeSections?: boolean;
+      }) => {
         if (msg.type === "nodeClick") {
           await handleNodeClick(msg.id, msg.kind);
         } else if (msg.type === "refresh") {
-          // 更新ボタンが押されたら最新のグラフを再取得して送り直す。
-          await fetchAndSendGraph();
+          // 更新ボタン: section の現在状態を引き継いで再取得する。
+          await fetchAndSendGraph(msg.includeSections === true);
+        } else if (msg.type === "sectionChange") {
+          // section チェックボックスが ON になった → sections 込みで再取得。
+          await fetchAndSendGraph(msg.include === true);
         }
       }
     );
@@ -133,9 +144,12 @@ async function showGraphView(context: ExtensionContext): Promise<void> {
 
 /**
  * LSP からグラフ JSON を取得して Webview に送る。
- * showGraphView の初回表示と、更新ボタン押下（"refresh" メッセージ）の両方で使う。
+ *
+ * `includeSections = false`（デフォルト）のとき Section ノードと Contains 辺を除外する。
+ * doc 1 本あたり見出し数分だけ発生するこれらを省くと転送量と JS メモリが大きく下がる。
+ * section チェックボックスを ON にしたとき（sectionChange メッセージ）は `true` を渡す。
  */
-async function fetchAndSendGraph(): Promise<void> {
+async function fetchAndSendGraph(includeSections = false): Promise<void> {
   if (!graphPanel) return;
 
   let graphData: unknown = { nodes: [], edges: [] };
@@ -143,7 +157,7 @@ async function fetchAndSendGraph(): Promise<void> {
     try {
       graphData = await client.sendRequest(ExecuteCommandRequest.type, {
         command: "dbrain/graph",
-        arguments: [],
+        arguments: [{ include_sections: includeSections }],
       });
     } catch {
       void window.showWarningMessage(
@@ -255,7 +269,7 @@ function buildWebviewHtml(scriptUri: Uri): string {
 }
 
 /**
- * グラフ上のノードがクリックされたときに定義ジャンプを行う（3-4）。
+ * グラフ上のノードがクリックされたときに定義ジャンプを行う。
  *
  * NodeId の文字列フォーマット（core/src/index.rs の node_id_string より）:
  *   - doc:path/to/file.md
@@ -267,20 +281,53 @@ async function handleNodeClick(nodeId: string, kind: string): Promise<void> {
   if (!rootUri) return;
 
   if (kind === "doc") {
-    // "doc:path/to/file.md" → ファイルを開く
     const rel = nodeId.replace(/^doc:/, "");
-    const fileUri = Uri.joinPath(rootUri, rel);
-    await commands.executeCommand("vscode.open", fileUri);
+    await window.showTextDocument(
+      await workspace.openTextDocument(Uri.joinPath(rootUri, rel))
+    );
   } else if (kind === "section") {
-    // "section:path/to/file.md#見出し" → ファイルを開く（見出し位置は M4 以降）
+    // 見出し内の行位置は M4 以降で対応。今はファイル先頭を開く。
     const rel = nodeId.replace(/^section:/, "").replace(/#.*$/, "");
-    const fileUri = Uri.joinPath(rootUri, rel);
-    await commands.executeCommand("vscode.open", fileUri);
+    await window.showTextDocument(
+      await workspace.openTextDocument(Uri.joinPath(rootUri, rel))
+    );
   } else if (kind === "symbol") {
-    // symbol ノードのジャンプは LSP の GotoDefinition に委ねる（M3 スコープ外）。
-    // 今後 SymbolId → ファイル位置のマッピングをコマンド経由で取得する設計を検討。
-    void window.showInformationMessage(
-      `symbol ノード「${nodeId}」のジャンプは今後実装予定です。`
+    await jumpToSymbol(nodeId, rootUri);
+  }
+}
+
+/**
+ * "symbol:42" のノードクリックで、LSP に SymbolId を問い合わせてジャンプする。
+ *
+ * LSP の "dbrain/symbolInfo" コマンドが {file, line, character} を返す。
+ * これをもとに `showTextDocument` でカーソルを定義名に合わせて開く。
+ */
+async function jumpToSymbol(nodeId: string, rootUri: Uri): Promise<void> {
+  if (!client) return;
+
+  // "symbol:42" → 42 (SymbolId の数値)
+  const symbolId = parseInt(nodeId.replace(/^symbol:/, ""), 10);
+  if (isNaN(symbolId)) return;
+
+  type SymbolInfo = { file: string; line: number; character: number };
+
+  try {
+    const info = (await client.sendRequest(ExecuteCommandRequest.type, {
+      command: "dbrain/symbolInfo",
+      arguments: [symbolId],
+    })) as SymbolInfo | null;
+
+    if (!info) return;
+
+    const pos = new Position(info.line, info.character);
+    const doc = await workspace.openTextDocument(Uri.joinPath(rootUri, info.file));
+    await window.showTextDocument(doc, {
+      selection: new Range(pos, pos),
+      viewColumn: ViewColumn.Active,
+    });
+  } catch {
+    void window.showWarningMessage(
+      `Developer Brain: シンボル情報の取得に失敗しました (${nodeId})`
     );
   }
 }
