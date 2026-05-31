@@ -35,6 +35,7 @@ use std::sync::Arc;
 use dbrain_core::index::{
     index_workspace, parse_links_with_ranges, ReferenceResolution, WorkspaceIndex,
 };
+use dbrain_core::model::{NodeId, RelPath, SymbolEntry, SymbolKind};
 use tokio::sync::RwLock;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
@@ -108,6 +109,7 @@ impl LanguageServer for Backend {
                     work_done_progress_options: Default::default(),
                 }),
                 definition_provider: Some(OneOf::Left(true)),
+                hover_provider: Some(HoverProviderCapability::Simple(true)),
                 ..Default::default()
             },
         })
@@ -252,6 +254,51 @@ impl LanguageServer for Backend {
 
         Ok(ref_to_location(&reference, index, root).map(GotoDefinitionResponse::Scalar))
     }
+
+    // --- Hover（2-5） ---
+    //
+    // [[...]] にカーソルを置くと、リンク先の概要を Markdown で表示する。
+    // ドキュメントリンクは見出し一覧、コードシンボルは種別・修飾名・ファイルを出す。
+
+    async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
+        let pos = params.text_document_position_params.position;
+        let s = self.state.read().await;
+        let (Some(index), Some(content)) = (
+            &s.index,
+            s.docs
+                .get(&params.text_document_position_params.text_document.uri),
+        ) else {
+            return Ok(None);
+        };
+
+        let found = parse_links_with_ranges(content)
+            .into_iter()
+            .find(|(_, range)| pos_in_range(pos, core_range_to_lsp(*range, content)));
+
+        let Some((reference, link_range)) = found else {
+            return Ok(None);
+        };
+
+        let text = match index.resolve_reference(&reference) {
+            ReferenceResolution::DocResolved(path) => format_doc_hover(&path, index),
+            ReferenceResolution::CodeResolved { id } => {
+                let Some(entry) = index.symbols.get(id) else {
+                    return Ok(None);
+                };
+                format_code_hover(entry)
+            }
+            _ => return Ok(None),
+        };
+
+        Ok(Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: text,
+            }),
+            // リンク範囲をそのまま返すことで、カーソルを動かしてもすぐ消えない。
+            range: Some(core_range_to_lsp(link_range, content)),
+        }))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -361,6 +408,71 @@ fn ref_to_location(reference: &Reference, index: &WorkspaceIndex, root: &Path) -
             Some(Location { uri, range })
         }
         _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Hover コンテンツ生成（2-5）
+// ---------------------------------------------------------------------------
+
+/// ドキュメントリンクの Hover テキストを生成する。
+///
+/// グラフの Section ノードを走査して見出し一覧を得る。
+/// 見出しがなければパスだけを表示する。
+fn format_doc_hover(path: &RelPath, index: &WorkspaceIndex) -> String {
+    let headings: Vec<&str> = index
+        .graph
+        .node_ids()
+        .filter_map(|n| match n {
+            NodeId::Section(p, h) if p == path => Some(h.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    if headings.is_empty() {
+        format!("**{}**", path.0)
+    } else {
+        let list = headings
+            .iter()
+            .map(|h| format!("- {h}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("**{}**\n\n{}", path.0, list)
+    }
+}
+
+/// コードシンボルの Hover テキストを生成する。
+///
+/// 種別（fn / struct 等）・修飾名・ファイルパスを Markdown で組み立てる。
+fn format_code_hover(entry: &SymbolEntry) -> String {
+    let kind = entry
+        .descriptor
+        .kind
+        .map(symbol_kind_str)
+        .unwrap_or("symbol");
+    let qualified = entry.descriptor.path.0.join("::");
+    format!(
+        "**{}** `{}`\n\n`{}`",
+        kind, qualified, entry.descriptor.file.0
+    )
+}
+
+/// [`SymbolKind`] を人が読みやすい短い文字列に変換する。
+fn symbol_kind_str(kind: SymbolKind) -> &'static str {
+    match kind {
+        SymbolKind::Function => "fn",
+        SymbolKind::Method => "fn",
+        SymbolKind::Struct => "struct",
+        SymbolKind::Enum => "enum",
+        SymbolKind::Trait => "trait",
+        SymbolKind::Type => "type",
+        SymbolKind::Const => "const",
+        SymbolKind::Static => "static",
+        SymbolKind::Field => "field",
+        SymbolKind::Variant => "variant",
+        SymbolKind::Variable => "var",
+        SymbolKind::Macro => "macro!",
+        SymbolKind::Module => "mod",
     }
 }
 
