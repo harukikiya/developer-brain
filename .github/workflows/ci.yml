@@ -1,0 +1,61 @@
+# =============================================================================
+# CI — Pull Request / push のたびに回す「壊れていないか」の検査
+# =============================================================================
+# 4 つのジョブを並列で回す:
+#   rust      : フォーマット / lint(clippy) / テスト
+#   docs      : cargo doc が警告なく通るか（壊れたドキュメントリンクを検出）
+#   extension : VS Code 拡張の型チェックとバンドル
+# 1 つでも失敗すると PR がマージできない、という運用が基本。
+# =============================================================================
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  rust:
+    name: Rust (fmt / clippy / test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      # ビルド成果物をキャッシュして 2 回目以降を速くする。
+      - uses: Swatinem/rust-cache@v2
+      - name: フォーマット確認（整形されていない差分があれば失敗）
+        run: cargo fmt --all --check
+      - name: clippy（警告もエラー扱いにして品質を強制）
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: テスト
+        run: cargo test --all
+
+  docs:
+    name: Docs (rustdoc 検証)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Pages に公開するのと同じ内容を、警告ゼロで生成できるか確認する。
+      - name: rustdoc を厳格ビルド
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --no-deps --workspace
+
+  extension:
+    name: VS Code extension (typecheck / bundle)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: editor
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: editor/package-lock.json
+      - run: npm ci
+      - run: npm run build

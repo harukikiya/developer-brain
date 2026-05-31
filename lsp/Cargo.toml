@@ -1,0 +1,19 @@
+[package]
+name = "dbrain-lsp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "dbrain-lsp"
+path = "src/main.rs"
+
+[dependencies]
+dbrain-core = { path = "../core" }
+tower-lsp = "0.20"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std"] }
+serde.workspace = true
+serde_json.workspace = true
+# tower-lsp -> lsp-types -> url -> idna(>=1.0) -> idna_adapter は edition2024 を要求し、
+# 古い toolchain でビルドできない。url を idna 0.5 系に固定して回避する。
+url = "=2.5.0"

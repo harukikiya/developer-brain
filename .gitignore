@@ -1,0 +1,7 @@
+/target
+**/node_modules
+editor/dist
+*.vsix
+
+# Claude Code: 個人用のローカル設定は共有しない（チーム共有は .claude/settings.json）
+.claude/settings.local.json

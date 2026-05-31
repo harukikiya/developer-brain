@@ -1,0 +1,13 @@
+[package]
+name = "dbrain-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "dbrain"
+path = "src/main.rs"
+
+[dependencies]
+dbrain-core = { path = "../core" }
+serde_json.workspace = true

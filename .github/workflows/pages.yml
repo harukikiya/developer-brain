@@ -1,0 +1,67 @@
+# =============================================================================
+# Pages — 仕様書(rustdoc)を GitHub Pages へ自動公開する CD
+# =============================================================================
+# main に push されるたびに、コアの doc コメントから生成した HTML を
+# GitHub Pages に公開する。doc コメント = 公開仕様書、という運用。
+#
+# 事前準備（リポジトリ側で 1 回だけ）:
+#   Settings > Pages > Build and deployment > Source を
+#   「GitHub Actions」に設定する。
+#
+# 公開後の URL の目安:
+#   https://<ユーザ名>.github.io/<リポジトリ名>/dbrain_core/index.html
+# =============================================================================
+name: Pages
+
+on:
+  push:
+    branches: [main]
+  # 手動実行も可能にしておく（Actions タブの "Run workflow"）。
+  workflow_dispatch:
+
+# Pages への書き込みに必要な権限。
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# 同時に走らせない（後から来たデプロイを優先）。
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: rustdoc を生成
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --no-deps --workspace
+
+      # rustdoc はサイト全体の入口(index.html)を作らないので、
+      # コアの doc へ自動転送する小さな index を置く。
+      - name: トップページのリダイレクトを作成
+        run: |
+          echo '<!doctype html><meta http-equiv="refresh" content="0; url=dbrain_core/index.html">' \
+            > target/doc/index.html
+
+      - name: Pages 用に成果物をアップロード
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: target/doc
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Pages へデプロイ
+        id: deployment
+        uses: actions/deploy-pages@v4

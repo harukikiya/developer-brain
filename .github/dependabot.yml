@@ -1,0 +1,16 @@
+# 依存関係の更新 PR を自動で出してくれる設定。
+# cargo / npm / GitHub Actions の 3 つのエコシステムを毎週チェックする。
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+  - package-ecosystem: npm
+    directory: "/editor"
+    schedule:
+      interval: weekly
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
