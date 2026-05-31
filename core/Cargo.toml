@@ -10,5 +10,5 @@ serde_json.workspace = true
 pulldown-cmark = "0.9"
 walkdir = "2"
 tree-sitter = "0.20"
-tree-sitter-rust = "0.20"
+tree-sitter-rust = "0.21"
 tree-sitter-c = "0.20"
