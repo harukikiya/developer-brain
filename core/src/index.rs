@@ -255,6 +255,63 @@ pub struct WorkspaceIndex {
     /// ワークスペース内の全 `.md` パス集合（相対パス・`/` 区切り）。
     /// DocumentLink でリンク先が実在するか確認するための高速ルックアップ用。
     pub doc_paths: HashSet<String>,
+    /// ファイル名ステム（拡張子・ディレクトリなし）→ パス。
+    /// 一意に定まる場合は `Some(path)`、同名が複数ある場合は `None`（短縮名解決用）。
+    /// 例: `"spec"` → `Some(RelPath("docs/spec.md"))` なら `[[spec]]` が解決できる。
+    pub doc_by_stem: HashMap<String, Option<RelPath>>,
+}
+
+/// [`WorkspaceIndex::resolve_reference`] が返す解決結果。
+///
+/// この型は `dbrain-core` 側に置く——「賢さはコアに」の原則より、
+/// LSP / MCP / CLI が同じロジックを重複実装しないよう共有する。
+/// エディタ側アダプタはこれをパターンマッチして各プロトコルの型に変換するだけでよい。
+#[derive(Debug)]
+pub enum ReferenceResolution {
+    /// ドキュメントリンクが一意に解決できた。
+    DocResolved(RelPath),
+    /// 同名ステムが複数あり、どのドキュメントか一意に定まらない。
+    /// フルパス指定に直すよう案内する。
+    DocAmbiguous,
+    /// 対応するドキュメントが存在しない。
+    DocDangling,
+    /// コードシンボルが一意に解決できた。`id` で [`SymbolTable::get`] を引ける。
+    CodeResolved { id: crate::model::SymbolId },
+    /// 同名・同パスのシンボルが複数（C++ オーバーロード等）。
+    CodeAmbiguous(Vec<crate::model::SymbolId>),
+    /// 対応するシンボルが見つからない（リネームや削除後の dangling 参照）。
+    CodeDangling,
+}
+
+impl WorkspaceIndex {
+    /// `[[...]]` 参照を索引に照らして解決する。
+    ///
+    /// エディタ機能（DocumentLink・GotoDefinition・Hover・診断）はこれを呼び、
+    /// 返り値をパターンマッチして各プロトコルの型に変換する。
+    /// 解決ロジックが 1 か所に集約されるため、LSP・MCP・CLI で実装を重複させない。
+    pub fn resolve_reference(&self, reference: &Reference) -> ReferenceResolution {
+        match reference {
+            Reference::Doc { target, .. } => match target {
+                DocTarget::Path(p) => {
+                    if self.doc_paths.contains(&p.0) {
+                        ReferenceResolution::DocResolved(p.clone())
+                    } else {
+                        ReferenceResolution::DocDangling
+                    }
+                }
+                DocTarget::Name(name) => match self.doc_by_stem.get(name.as_str()) {
+                    Some(Some(path)) => ReferenceResolution::DocResolved(path.clone()),
+                    Some(None) => ReferenceResolution::DocAmbiguous,
+                    None => ReferenceResolution::DocDangling,
+                },
+            },
+            Reference::Code(desc) => match self.symbols.resolve(desc) {
+                Resolution::Resolved { id, .. } => ReferenceResolution::CodeResolved { id },
+                Resolution::Ambiguous(ids) => ReferenceResolution::CodeAmbiguous(ids),
+                Resolution::Dangling => ReferenceResolution::CodeDangling,
+            },
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -430,6 +487,7 @@ pub fn index_workspace(root: &Path) -> WorkspaceIndex {
         graph,
         symbols,
         doc_paths,
+        doc_by_stem: stem_to_path,
     }
 }
 

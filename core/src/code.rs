@@ -62,7 +62,7 @@ fn collect(
                     } else {
                         SymbolKind::Function
                     };
-                    push(out, file, scope, &name, kind, child, name_node);
+                    push(out, file, scope, &name, kind, child, name_node, src);
                 }
             }
             // フィールド/バリアントには降りない（Field は将来対応）。
@@ -77,6 +77,7 @@ fn collect(
                         SymbolKind::Struct,
                         child,
                         name_node,
+                        src,
                     );
                     scope.push(Frame {
                         name,
@@ -89,7 +90,16 @@ fn collect(
             // enum: 型を積み、バリアントを Variant として拾う。
             "enum_item" => {
                 if let Some((name, name_node)) = field_name(child, "name", src) {
-                    push(out, file, scope, &name, SymbolKind::Enum, child, name_node);
+                    push(
+                        out,
+                        file,
+                        scope,
+                        &name,
+                        SymbolKind::Enum,
+                        child,
+                        name_node,
+                        src,
+                    );
                     scope.push(Frame {
                         name,
                         type_scope: false,
@@ -106,7 +116,16 @@ fn collect(
             // trait は記号でもありメソッド群のスコープでもある。
             "trait_item" => {
                 if let Some((name, name_node)) = field_name(child, "name", src) {
-                    push(out, file, scope, &name, SymbolKind::Trait, child, name_node);
+                    push(
+                        out,
+                        file,
+                        scope,
+                        &name,
+                        SymbolKind::Trait,
+                        child,
+                        name_node,
+                        src,
+                    );
                     scope.push(Frame {
                         name,
                         type_scope: true,
@@ -126,6 +145,7 @@ fn collect(
                         SymbolKind::Module,
                         child,
                         name_node,
+                        src,
                     );
                     scope.push(Frame {
                         name,
@@ -162,7 +182,7 @@ fn emit(
     out: &mut Vec<SymbolEntry>,
 ) {
     if let Some((name, name_node)) = field_name(child, "name", src) {
-        push(out, file, scope, &name, kind, child, name_node);
+        push(out, file, scope, &name, kind, child, name_node, src);
     }
 }
 
@@ -184,7 +204,16 @@ fn emit_rust_fields(
     for f in body.children(&mut cursor) {
         if f.kind() == "field_declaration" {
             if let Some((name, name_node)) = field_name(f, "name", src) {
-                push(out, file, scope, &name, SymbolKind::Field, f, name_node);
+                push(
+                    out,
+                    file,
+                    scope,
+                    &name,
+                    SymbolKind::Field,
+                    f,
+                    name_node,
+                    src,
+                );
             }
         }
     }
@@ -206,13 +235,24 @@ fn emit_rust_variants(
     for v in body.children(&mut cursor) {
         if v.kind() == "enum_variant" {
             if let Some((name, name_node)) = field_name(v, "name", src) {
-                push(out, file, scope, &name, SymbolKind::Variant, v, name_node);
+                push(
+                    out,
+                    file,
+                    scope,
+                    &name,
+                    SymbolKind::Variant,
+                    v,
+                    name_node,
+                    src,
+                );
             }
         }
     }
 }
 
 /// 記述子を組み立てて 1 件追加する。path = スコープ名 + 自分の名前。
+// `src` の追加で引数が 8 個になるが、単純な内部ヘルパへの許容範囲として抑制する。
+#[allow(clippy::too_many_arguments)]
 fn push(
     out: &mut Vec<SymbolEntry>,
     file: &RelPath,
@@ -221,6 +261,7 @@ fn push(
     kind: SymbolKind,
     def: Node,
     name_node: Node,
+    src: &str,
 ) {
     let mut path: Vec<String> = scope.iter().map(|f| f.name.clone()).collect();
     path.push(name.to_string());
@@ -231,8 +272,8 @@ fn push(
             kind: Some(kind),
             disambiguator: None,
         },
-        range: node_range(def),
-        name_range: node_range(name_node),
+        range: node_range(def, src),
+        name_range: node_range(name_node, src),
     });
 }
 
@@ -252,21 +293,34 @@ fn impl_type_name(impl_node: Node, src: &str) -> Option<String> {
     Some(last.to_string())
 }
 
-/// tree-sitter の位置（0 始まり・列はバイト）を [`Range`] に変換する。
-/// LSP が必要とする UTF-16 への変換は LSP アダプタ層の責務。
-fn node_range(node: Node) -> Range {
+/// tree-sitter の位置（0 始まり）を [`Range`] に変換する。
+///
+/// tree-sitter の `column` はバイト列だが、[`model::Position::character`] は
+/// UTF-8 コードポイント数（char 数）で統一する。ASCII 識別子では両者は一致するが、
+/// 日本語識別子（`#[allow(non_ascii_idents)]`）があると食い違うため、ここで変換する。
+/// LSP が要求する UTF-16 への変換は LSP アダプタ層の責務（[`dbrain_lsp`] 側で行う）。
+fn node_range(node: Node, src: &str) -> Range {
     let s = node.start_position();
     let e = node.end_position();
     Range {
         start: Position {
             line: s.row as u32,
-            character: s.column as u32,
+            character: byte_col_to_char_count(src, s.row, s.column),
         },
         end: Position {
             line: e.row as u32,
-            character: e.column as u32,
+            character: byte_col_to_char_count(src, e.row, e.column),
         },
     }
+}
+
+/// tree-sitter のバイト列（`column`）を UTF-8 char 数に変換するヘルパ。
+///
+/// `src` の `row` 行目の先頭から `byte_col` バイト目までに含まれる Unicode
+/// スカラー値の個数を返す。`byte_col` が行末を超える場合は行末で打ち切る。
+fn byte_col_to_char_count(src: &str, row: usize, byte_col: usize) -> u32 {
+    let line = src.lines().nth(row).unwrap_or("");
+    line[..byte_col.min(line.len())].chars().count() as u32
 }
 
 // ---------------------------------------------------------------------------
@@ -318,14 +372,22 @@ fn collect_c(node: Node, src: &str, file: &RelPath, out: &mut Vec<SymbolEntry>) 
             "function_definition" => {
                 if let Some(decl) = child.child_by_field_name("declarator") {
                     if let Some((name, name_node)) = declarator_name(decl, src) {
-                        push_c(out, file, &name, SymbolKind::Function, child, name_node);
+                        push_c(
+                            out,
+                            file,
+                            &name,
+                            SymbolKind::Function,
+                            child,
+                            name_node,
+                            src,
+                        );
                     }
                 }
             }
             // #define（オブジェクト形式・関数形式とも）→ Macro。
             "preproc_def" | "preproc_function_def" => {
                 if let Some((name, name_node)) = field_name(child, "name", src) {
-                    push_c(out, file, &name, SymbolKind::Macro, child, name_node);
+                    push_c(out, file, &name, SymbolKind::Macro, child, name_node, src);
                 }
             }
             // typedef → 新しい型名を Type に。型部に struct/enum 定義があれば併せて拾う。
@@ -367,7 +429,7 @@ fn emit_c_tagged(node: Node, src: &str, file: &RelPath, out: &mut Vec<SymbolEntr
     } else {
         SymbolKind::Struct
     };
-    push_c(out, file, &tag_name, kind, node, name_node);
+    push_c(out, file, &tag_name, kind, node, name_node, src);
 
     // メンバを拾う。
     if is_enum {
@@ -407,6 +469,7 @@ fn emit_struct_fields(
                         SymbolKind::Field,
                         field,
                         name_node,
+                        src,
                     );
                 }
             }
@@ -421,7 +484,7 @@ fn emit_enum_constants(body: Node, src: &str, file: &RelPath, out: &mut Vec<Symb
     for e in body.children(&mut cursor) {
         if e.kind() == "enumerator" {
             if let Some((name, name_node)) = field_name(e, "name", src) {
-                push_c(out, file, &name, SymbolKind::Const, e, name_node);
+                push_c(out, file, &name, SymbolKind::Const, e, name_node, src);
             }
         }
     }
@@ -460,7 +523,7 @@ fn emit_c_declaration(node: Node, src: &str, file: &RelPath, out: &mut Vec<Symbo
                 } else {
                     SymbolKind::Variable
                 };
-                push_c(out, file, &name, kind, node, name_node);
+                push_c(out, file, &name, kind, node, name_node, src);
             }
         }
     }
@@ -485,7 +548,7 @@ fn emit_c_typedef(node: Node, src: &str, file: &RelPath, out: &mut Vec<SymbolEnt
             continue;
         }
         if let Some((name, name_node)) = declarator_name(c, src) {
-            push_c(out, file, &name, SymbolKind::Type, node, name_node);
+            push_c(out, file, &name, SymbolKind::Type, node, name_node, src);
         }
     }
 }
@@ -539,8 +602,9 @@ fn push_c(
     kind: SymbolKind,
     def: Node,
     name_node: Node,
+    src: &str,
 ) {
-    push_c_path(out, file, vec![name.to_string()], kind, def, name_node);
+    push_c_path(out, file, vec![name.to_string()], kind, def, name_node, src);
 }
 
 /// 任意段の修飾名で記号を 1 件積む（フィールドの `[Tag, field]` 等）。
@@ -551,6 +615,7 @@ fn push_c_path(
     kind: SymbolKind,
     def: Node,
     name_node: Node,
+    src: &str,
 ) {
     out.push(SymbolEntry {
         descriptor: SymbolDescriptor {
@@ -559,8 +624,8 @@ fn push_c_path(
             kind: Some(kind),
             disambiguator: None,
         },
-        range: node_range(def),
-        name_range: node_range(name_node),
+        range: node_range(def, src),
+        name_range: node_range(name_node, src),
     });
 }
 
@@ -607,6 +672,15 @@ impl SymbolTable {
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// ID からシンボルエントリを取得する。
+    ///
+    /// GotoDefinition で `name_range`（名前部分だけの位置）を参照するときに使う。
+    /// 定義全体ではなく名前の先頭にカーソルを置きたいため、`range` ではなく
+    /// `name_range` を使うのが精度の良い実装になる。
+    pub fn get(&self, id: SymbolId) -> Option<&SymbolEntry> {
+        self.entries.get(id.0 as usize)
     }
 
     /// 登録済みシンボルを (ID, 実体) で走査する。
