@@ -270,6 +270,9 @@ pub struct WorkspaceIndex {
     /// 一意に定まる場合は `Some(path)`、同名が複数ある場合は `None`（短縮名解決用）。
     /// 例: `"spec"` → `Some(RelPath("docs/spec.md"))` なら `[[spec]]` が解決できる。
     pub doc_by_stem: HashMap<String, Option<RelPath>>,
+    /// `glossary/` 配下のノートから構築した用語集（D8 の仮想リンク用）。
+    /// 用語の出現位置は保存せず、[`find_term_mentions`] で要求時に算出する。
+    pub glossary: Glossary,
 }
 
 /// [`WorkspaceIndex::resolve_reference`] が返す解決結果。
@@ -341,28 +344,12 @@ impl WorkspaceIndex {
 /// - 文字位置は UTF-8 コードポイント数（Rust の `char` 数）。LSP が要求する
 ///   UTF-16 単位への変換は `lsp` クレートの責務。
 pub fn parse_links_with_ranges(content: &str) -> Vec<(Reference, model::Range)> {
-    use pulldown_cmark::{Event, Parser, Tag};
-
     let body = strip_frontmatter(content);
     // body は content の末尾スライス。ポインタ差でフロントマターのバイト数を得る。
     // Safety: body は content のサブスライスが保証されている（strip_frontmatter の実装より）。
     let fm_bytes = body.as_ptr() as usize - content.as_ptr() as usize;
 
-    // body 上のコードブロック・インラインコードの範囲を収集する（index_document と同じ手順）。
-    let mut code_ranges: Vec<Range<usize>> = Vec::new();
-    let mut codeblock_start: Option<usize> = None;
-    for (event, range) in Parser::new(body).into_offset_iter() {
-        match event {
-            Event::Start(Tag::CodeBlock(_)) => codeblock_start = Some(range.start),
-            Event::End(Tag::CodeBlock(_)) => {
-                if let Some(s) = codeblock_start.take() {
-                    code_ranges.push(s..range.end);
-                }
-            }
-            Event::Code(_) => code_ranges.push(range),
-            _ => {}
-        }
-    }
+    let code_ranges = collect_code_ranges(body);
 
     // body をバイト走査して [[...]] を見つけ、位置を付けて返す。
     let bytes = body.as_bytes();
@@ -407,6 +394,220 @@ fn byte_offset_to_position(text: &str, byte_offset: usize) -> model::Position {
     model::Position { line, character }
 }
 
+/// 本文中のコードブロック・インラインコードのバイト範囲を集める。
+///
+/// `[[...]]` リンクや用語の出現を、コード例の中で誤検出しないための除外範囲。
+/// [`parse_links_with_ranges`] と [`find_term_mentions`] が共有する。
+fn collect_code_ranges(body: &str) -> Vec<Range<usize>> {
+    use pulldown_cmark::{Event, Parser, Tag};
+
+    let mut ranges: Vec<Range<usize>> = Vec::new();
+    let mut codeblock_start: Option<usize> = None;
+    for (event, range) in Parser::new(body).into_offset_iter() {
+        match event {
+            Event::Start(Tag::CodeBlock(_)) => codeblock_start = Some(range.start),
+            Event::End(Tag::CodeBlock(_)) => {
+                if let Some(s) = codeblock_start.take() {
+                    ranges.push(s..range.end);
+                }
+            }
+            Event::Code(_) => ranges.push(range),
+            _ => {}
+        }
+    }
+    ranges
+}
+
+/// 本文中の `[[...]]` リンク全体のバイト範囲を集める。
+///
+/// 用語の自動リンク（[`find_term_mentions`]）が、既に明示リンクが張られた箇所に
+/// 二重でリンクを作らないための除外範囲。
+fn collect_wikilink_ranges(body: &str) -> Vec<Range<usize>> {
+    let bytes = body.as_bytes();
+    let mut ranges = Vec::new();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'[' && bytes[i + 1] == b'[' {
+            if let Some(off) = find_subslice(&bytes[i + 2..], b"]]") {
+                let end = i + 2 + off + 2; // 閉じ `]]` の直後
+                ranges.push(i..end);
+                i = end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    ranges
+}
+
+// ---------------------------------------------------------------------------
+// 用語集（M5: D8 非破壊な仮想リンク）
+// ---------------------------------------------------------------------------
+
+/// 用語集ノートを置くディレクトリ名。この配下の `.md` が用語エントリになる。
+/// 将来は設定可能にする余地があるが、まずは固定。
+const GLOSSARY_DIR: &str = "glossary";
+
+/// 用語集の 1 エントリ。`glossary/` 配下の 1 つの `.md` ノートに対応する。
+///
+/// 用語名はファイル名ステム（`glossary/LIN.md` → `"LIN"`）、`definition` は
+/// Hover 表示用の定義抜粋（本文の先頭段落）。本文自体は書き換えない（D8）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GlossaryTerm {
+    /// 正規の用語名（ファイル名ステム）。
+    pub name: String,
+    /// 用語ノートのパス（リンクの飛び先）。
+    pub path: RelPath,
+    /// Hover 表示用の定義抜粋。
+    pub definition: String,
+}
+
+/// 用語集。出現検出のための「表層形 → 用語」マッチング表を内部に持つ。
+///
+/// メモリは用語数に比例するだけ（出現位置は保存せず、要求時に
+/// [`find_term_mentions`] でライブ計算する）。これは References 辺と同じ思想
+/// （`CLAUDE.md` 不変条件①③）。
+#[derive(Debug, Default)]
+pub struct Glossary {
+    terms: Vec<GlossaryTerm>,
+    /// (表層形, terms 内インデックス) を長さ降順に並べたもの。最長一致のため。
+    patterns: Vec<(String, usize)>,
+}
+
+impl Glossary {
+    /// 用語リストからマッチング表を構築する。
+    pub fn new(terms: Vec<GlossaryTerm>) -> Self {
+        // 表層形は今は用語名のみ（別名 aliases は後続サブタスクで追加予定）。
+        let mut patterns: Vec<(String, usize)> = terms
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.name.clone(), i))
+            .collect();
+        // 長い表層形を先に試すことで最長一致を実現する
+        // （"状態遷移" を "状態" より優先）。
+        patterns.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        Glossary { terms, patterns }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.terms.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.terms.len()
+    }
+
+    /// インデックスから用語エントリを取得する。
+    pub fn get(&self, index: usize) -> Option<&GlossaryTerm> {
+        self.terms.get(index)
+    }
+
+    /// 全用語エントリを走査する。
+    pub fn terms(&self) -> &[GlossaryTerm] {
+        &self.terms
+    }
+}
+
+/// 用語の出現 1 件（位置付き）。位置はグラフに保存せず、要求時に算出する。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TermMention {
+    /// [`Glossary`] 内の用語インデックス。
+    pub term_index: usize,
+    /// 出現箇所のソース上の範囲。
+    pub range: model::Range,
+}
+
+/// 本文から用語の出現を **全件・位置付き** で検出する純粋関数（D8 の仮想リンクの実体）。
+///
+/// - コードブロック・インラインコード・既存の `[[...]]` リンク内は除外する。
+/// - ASCII 用語は単語境界を要求する（"LIN" が "LINUX" にマッチしない）。
+///   CJK を含む用語は単語境界が無いので部分一致を許す。
+/// - 最長一致優先（[`Glossary::new`] が表層形を長さ降順に並べてある）。
+/// - `current_path` が用語自身の定義ノートの場合、その用語は自己リンクしない。
+/// - 同じ用語が複数回出てもすべて返す（最初の 1 回に限定しない）。
+pub fn find_term_mentions(
+    content: &str,
+    glossary: &Glossary,
+    current_path: &RelPath,
+) -> Vec<TermMention> {
+    if glossary.is_empty() {
+        return Vec::new();
+    }
+
+    let body = strip_frontmatter(content);
+    let fm_bytes = body.as_ptr() as usize - content.as_ptr() as usize;
+    let code_ranges = collect_code_ranges(body);
+    let link_ranges = collect_wikilink_ranges(body);
+
+    let bytes = body.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        // コード範囲・既存リンク範囲の中はスキップ。
+        if in_any_range(i, &code_ranges) || in_any_range(i, &link_ranges) {
+            i += utf8_char_width(bytes[i]);
+            continue;
+        }
+
+        // この位置で最長一致する用語を探す（patterns は長さ降順）。
+        let mut matched_len = 0;
+        for (pat, term_idx) in &glossary.patterns {
+            let pb = pat.as_bytes();
+            if i + pb.len() > bytes.len() || &bytes[i..i + pb.len()] != pb {
+                continue;
+            }
+            // ASCII 用語は単語境界を要求する。
+            if pat.is_ascii() && !ascii_word_boundary_ok(bytes, i, pb.len()) {
+                continue;
+            }
+            matched_len = pb.len();
+            // 用語自身の定義ノートでは自己リンクしない（マッチはするが記録しない）。
+            if glossary.terms[*term_idx].path != *current_path {
+                let start = byte_offset_to_position(content, fm_bytes + i);
+                let end = byte_offset_to_position(content, fm_bytes + i + pb.len());
+                out.push(TermMention {
+                    term_index: *term_idx,
+                    range: model::Range { start, end },
+                });
+            }
+            break;
+        }
+
+        // マッチしたらその分進める。しなければ 1 文字進める（UTF-8 境界を保つ）。
+        i += if matched_len > 0 {
+            matched_len
+        } else {
+            utf8_char_width(bytes[i])
+        };
+    }
+    out
+}
+
+/// UTF-8 の先頭バイトから、その文字のバイト幅（1〜4）を返す。
+fn utf8_char_width(first_byte: u8) -> usize {
+    match first_byte {
+        0x00..=0x7F => 1,
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        _ => 4,
+    }
+}
+
+/// ASCII 用語の単語境界判定。マッチ範囲の前後が「単語を構成しない」なら true。
+///
+/// 単語構成文字 = ASCII 英数字 or `_`。例: "LIN" は "LINUX" の中ではマッチさせない。
+fn ascii_word_boundary_ok(bytes: &[u8], start: usize, len: usize) -> bool {
+    let before_ok = start == 0 || !is_word_byte(bytes[start - 1]);
+    let end = start + len;
+    let after_ok = end >= bytes.len() || !is_word_byte(bytes[end]);
+    before_ok && after_ok
+}
+
+/// 単語を構成するバイトか（ASCII 英数字または `_`）。
+fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
 // ---------------------------------------------------------------------------
 // ワークスペース全体の索引
 // ---------------------------------------------------------------------------
@@ -431,12 +632,24 @@ pub fn index_workspace(root: &Path) -> WorkspaceIndex {
     }
 
     // --- pass 1: 全 .md を読み、Doc/Section ノードと Contains 辺を作る ---
+    // 同時に glossary/ 配下のノートを用語集エントリとして収集する（D8）。
     let mut docs: Vec<(RelPath, ParsedDoc)> = Vec::new();
+    let mut glossary_terms: Vec<GlossaryTerm> = Vec::new();
     for path in walk_by_ext(root, "md") {
         let rel = to_rel(root, &path);
         let content = std::fs::read_to_string(&path).unwrap_or_default();
+        if is_glossary_note(&rel.0) {
+            if let Some(name) = file_stem(&rel.0) {
+                glossary_terms.push(GlossaryTerm {
+                    name,
+                    path: rel.clone(),
+                    definition: glossary_excerpt(&content),
+                });
+            }
+        }
         docs.push((rel, index_document(&content)));
     }
+    let glossary = Glossary::new(glossary_terms);
 
     let mut doc_paths: HashSet<String> = HashSet::new();
     // 短縮名（ファイル名ステム）→ パス。一意なものだけ解決に使う。
@@ -499,7 +712,25 @@ pub fn index_workspace(root: &Path) -> WorkspaceIndex {
         symbols,
         doc_paths,
         doc_by_stem: stem_to_path,
+        glossary,
     }
+}
+
+/// 相対パスが用語集ノートか（先頭ディレクトリが `glossary`）を判定する。
+fn is_glossary_note(rel: &str) -> bool {
+    rel.split('/').next() == Some(GLOSSARY_DIR)
+}
+
+/// 用語集ノートの本文から Hover 表示用の定義抜粋を取り出す。
+///
+/// フロントマターと見出し記号を除いた最初の非空行を返す（簡潔さ優先）。
+fn glossary_excerpt(content: &str) -> String {
+    strip_frontmatter(content)
+        .lines()
+        .map(|l| l.trim_start_matches('#').trim())
+        .find(|l| !l.is_empty())
+        .unwrap_or("")
+        .to_string()
 }
 
 /// Symbol ノードの表示ラベル（記述子そのものを読める形に）。例: `core/src/model.rs@SymbolDescriptor`。
@@ -999,5 +1230,147 @@ mod tests {
             }
             other => panic!("expected doc link to real.md, got {other:?}"),
         }
+    }
+
+    // ----- 用語集（M5: find_term_mentions / Glossary / is_glossary_note 等） -----
+
+    /// テスト用の用語集を組み立てる小道具。
+    fn glossary_of(terms: &[(&str, &str)]) -> Glossary {
+        Glossary::new(
+            terms
+                .iter()
+                .map(|(name, path)| GlossaryTerm {
+                    name: name.to_string(),
+                    path: RelPath(path.to_string()),
+                    definition: format!("{name} の定義"),
+                })
+                .collect(),
+        )
+    }
+
+    /// 観点: 本文中の用語出現を全件、位置付きで検出する（CJK は部分一致）。
+    #[test]
+    fn find_term_mentions_detects_all_occurrences() {
+        let g = glossary_of(&[("状態", "glossary/状態.md")]);
+        let md = "状態を持つ。次の状態へ遷移する。";
+        let ms = find_term_mentions(md, &g, &RelPath("doc.md".into()));
+        // "状態" は 2 回出現する。
+        assert_eq!(ms.len(), 2);
+        assert_eq!(ms[0].range.start.character, 0);
+        // 2 件目の "状態" は char 8（状0 態1 を2 持3 つ4 。5 次6 の7 状8）。
+        assert_eq!(ms[1].range.start.character, 8);
+    }
+
+    /// 観点: 最長一致優先（"状態遷移" を "状態" より優先して 1 件に）。
+    #[test]
+    fn find_term_mentions_prefers_longest() {
+        let g = glossary_of(&[
+            ("状態", "glossary/状態.md"),
+            ("状態遷移", "glossary/状態遷移.md"),
+        ]);
+        let md = "状態遷移について";
+        let ms = find_term_mentions(md, &g, &RelPath("doc.md".into()));
+        assert_eq!(ms.len(), 1);
+        // "状態遷移"（4文字）にマッチしたので、その用語が選ばれている。
+        let term = g.get(ms[0].term_index).unwrap();
+        assert_eq!(term.name, "状態遷移");
+    }
+
+    /// 観点: ASCII 用語は単語境界を要求する（"LIN" は "LINUX" にマッチしない）。
+    #[test]
+    fn find_term_mentions_ascii_word_boundary() {
+        let g = glossary_of(&[("LIN", "glossary/LIN.md")]);
+        // "LIN" 単独はマッチ、"LINUX" の中はマッチしない。
+        let ms = find_term_mentions("LIN bus and LINUX", &g, &RelPath("doc.md".into()));
+        assert_eq!(ms.len(), 1);
+        assert_eq!(ms[0].range.start.character, 0);
+    }
+
+    /// 観点: コードブロック・インラインコード・既存リンク内は除外する。
+    #[test]
+    fn find_term_mentions_excludes_code_and_links() {
+        let g = glossary_of(&[("LIN", "glossary/LIN.md")]);
+        let md = "LIN を使う。`LIN` は除外。\n\n```\nLIN\n```\n\n[[LIN]] も除外。";
+        let ms = find_term_mentions(md, &g, &RelPath("doc.md".into()));
+        // 本文先頭の "LIN" 1 件のみ。インラインコード・コードブロック・[[]] は除外。
+        assert_eq!(ms.len(), 1);
+        assert_eq!(ms[0].range.start.line, 0);
+    }
+
+    /// 観点: 用語自身の定義ノートでは自己リンクしない。
+    #[test]
+    fn find_term_mentions_skips_self_definition() {
+        let g = glossary_of(&[("LIN", "glossary/LIN.md")]);
+        let body = "LIN はネットワークプロトコル。";
+        // 定義ノート自身（glossary/LIN.md）を走査 → 自己リンクしない。
+        let in_self = find_term_mentions(body, &g, &RelPath("glossary/LIN.md".into()));
+        assert!(in_self.is_empty());
+        // 別ノートでは普通にリンクする。
+        let in_other = find_term_mentions(body, &g, &RelPath("doc.md".into()));
+        assert_eq!(in_other.len(), 1);
+    }
+
+    /// 観点: フロントマターを跨いでも位置（行）が正しく計算される。
+    #[test]
+    fn find_term_mentions_accounts_for_frontmatter() {
+        let g = glossary_of(&[("LIN", "glossary/LIN.md")]);
+        let md = "---\ntitle: x\n---\n\nLIN を参照。";
+        let ms = find_term_mentions(md, &g, &RelPath("doc.md".into()));
+        assert_eq!(ms.len(), 1);
+        // フロントマター 3 行 + 空行 = 行 4 に本文。
+        assert_eq!(ms[0].range.start.line, 4);
+    }
+
+    /// 観点: 空の用語集では何も検出しない（早期 return）。
+    #[test]
+    fn find_term_mentions_empty_glossary() {
+        let g = Glossary::default();
+        assert!(find_term_mentions("何か", &g, &RelPath("doc.md".into())).is_empty());
+    }
+
+    /// 観点: is_glossary_note が glossary/ 配下のみ true。
+    #[test]
+    fn is_glossary_note_detects_folder() {
+        assert!(is_glossary_note("glossary/LIN.md"));
+        assert!(is_glossary_note("glossary/sub/X.md"));
+        assert!(!is_glossary_note("docs/glossary.md"));
+        assert!(!is_glossary_note("LIN.md"));
+    }
+
+    /// 観点: glossary_excerpt はフロントマター・見出し記号を除いた最初の非空行。
+    #[test]
+    fn glossary_excerpt_extracts_first_line() {
+        assert_eq!(
+            glossary_excerpt("---\nk: v\n---\n# LIN\n\nLIN は通信規格。"),
+            "LIN"
+        );
+        assert_eq!(glossary_excerpt("\n\n本体の説明"), "本体の説明");
+    }
+
+    /// 観点: index_workspace が glossary/ のノートを用語集に取り込む。
+    #[test]
+    fn workspace_builds_glossary() {
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("dbrain_ws_gloss_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("glossary")).unwrap();
+        fs::write(
+            dir.join("glossary/LIN.md"),
+            "# LIN\n\nローカル相互接続網。\n",
+        )
+        .unwrap();
+        fs::write(dir.join("doc.md"), "LIN を採用する。\n").unwrap();
+
+        let idx = index_workspace(&dir);
+        assert_eq!(idx.glossary.len(), 1);
+        let term = &idx.glossary.terms()[0];
+        assert_eq!(term.name, "LIN");
+        assert_eq!(term.definition, "LIN");
+
+        // doc.md 側で用語出現が検出できる。
+        let ms = find_term_mentions("LIN を採用する。", &idx.glossary, &RelPath("doc.md".into()));
+        assert_eq!(ms.len(), 1);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
