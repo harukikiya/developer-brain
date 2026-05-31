@@ -571,8 +571,20 @@ impl LanguageServer for Backend {
 }
 
 // ---------------------------------------------------------------------------
-// 再索引（M4 4-1）
+// 再索引（M4 4-1 / 4-4）
 // ---------------------------------------------------------------------------
+
+/// 再索引完了をクライアントへ知らせるカスタム通知（M4 4-4）。
+///
+/// LSP 標準にない独自メソッド。診断の push と同じく「応答を期待しない一方向
+/// メッセージ」で、サーバ→クライアントへ送る。拡張側はこれを購読し、
+/// グラフビューが開いていれば最新のグラフを取り直す。パラメータは持たない。
+enum GraphChangedNotification {}
+
+impl tower_lsp::lsp_types::notification::Notification for GraphChangedNotification {
+    type Params = ();
+    const METHOD: &'static str = "dbrain/graphChanged";
+}
 
 /// ワークスペースを索引し直し、結果を state に格納して全ドキュメントの診断を更新する。
 ///
@@ -617,6 +629,10 @@ async fn reindex(state: Arc<RwLock<State>>, client: Client) {
             for uri in open_uris {
                 push_diagnostics(&uri, &state, &client).await;
             }
+            // グラフが変わった可能性があるので、開いている Webview に再取得を促す。
+            client
+                .send_notification::<GraphChangedNotification>(())
+                .await;
         }
         Err(e) => {
             client

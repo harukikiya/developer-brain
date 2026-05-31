@@ -34,6 +34,10 @@ let client: LanguageClient | undefined;
 // 既に開いているグラフパネルを再利用する（複数開かないようにする）。
 let graphPanel: WebviewPanel | undefined;
 
+// 直近に取得したグラフで section を含めたかどうか。
+// 自動更新（dbrain/graphChanged）時に同じフィルタ状態を保つために覚えておく。
+let lastIncludeSections = false;
+
 /**
  * 拡張が有効化されたときに呼ばれる。
  */
@@ -69,7 +73,15 @@ export function activate(context: ExtensionContext): void {
     serverOptions,
     clientOptions
   );
-  void client.start();
+  // クライアント起動後に、サーバからの再索引完了通知を購読する（M4 4-4）。
+  // グラフビューが開いていれば、直近のフィルタ状態を保ったまま自動で取り直す。
+  void client.start().then(() => {
+    client?.onNotification("dbrain/graphChanged", () => {
+      if (graphPanel) {
+        void fetchAndSendGraph(lastIncludeSections);
+      }
+    });
+  });
 
   // --- 2. "Show Graph" コマンドの登録（3-2/3-3/3-4）---
   context.subscriptions.push(
@@ -151,6 +163,9 @@ async function showGraphView(context: ExtensionContext): Promise<void> {
  */
 async function fetchAndSendGraph(includeSections = false): Promise<void> {
   if (!graphPanel) return;
+
+  // 自動更新（graphChanged）が同じフィルタ状態を再現できるよう覚えておく。
+  lastIncludeSections = includeSections;
 
   let graphData: unknown = { nodes: [], edges: [] };
   if (client) {
