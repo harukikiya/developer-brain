@@ -16,4 +16,4 @@ serde.workspace = true
 serde_json.workspace = true
 # tower-lsp -> lsp-types -> url -> idna(>=1.0) -> idna_adapter は edition2024 を要求し、
 # 古い toolchain でビルドできない。url を idna 0.5 系に固定して回避する。
-url = "=2.5.0"
+url = "=2.5.8"
