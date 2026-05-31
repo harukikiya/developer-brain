@@ -30,7 +30,9 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use dbrain_core::index::{
     index_workspace, parse_links_with_ranges, ReferenceResolution, WorkspaceIndex,
@@ -71,11 +73,50 @@ impl State {
 struct Backend {
     client: Client,
     state: Arc<RwLock<State>>,
+    /// 再索引の「変更世代」カウンタ（デバウンス用）。
+    ///
+    /// 変更トリガーのたびに +1 する。スケジュールされた再索引タスクは
+    /// 起床時にこの値が自分の捕捉した世代と一致するかを確認し、
+    /// 一致しなければ（より新しいトリガーが来ていれば）自分を破棄する。
+    /// これで「連続トリガーの最後の 1 回だけ実行」を実現する（[`Backend::schedule_reindex`]）。
+    reindex_generation: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for Backend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Backend").finish_non_exhaustive()
+    }
+}
+
+/// 再索引デバウンスの待機時間。連続した変更トリガーをこの時間まとめる。
+const REINDEX_DEBOUNCE: Duration = Duration::from_millis(300);
+
+impl Backend {
+    /// 再索引を「デバウンス付き」でスケジュールする（M4 4-3）。
+    ///
+    /// 連続した保存やファイル変更で再索引が何度も走るのを防ぐ。仕組み:
+    /// 1. 世代カウンタを +1 し、その新しい値（`my_gen`）を覚える。
+    /// 2. [`REINDEX_DEBOUNCE`] だけ待つ。
+    /// 3. 起床時にカウンタがまだ `my_gen` のままなら（後続トリガーが無ければ）
+    ///    実際に再索引する。進んでいれば自分は破棄する。
+    ///
+    /// これで「連続トリガーの最後の 1 回だけが実行される」。待ち行列も
+    /// チャンネルも要らず、`AtomicU64` 1 個で完結する。
+    fn schedule_reindex(&self) {
+        // fetch_add は加算前の値を返すので、+1 した新しい値が my_gen。
+        let my_gen = self.reindex_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let generation = Arc::clone(&self.reindex_generation);
+        let state = Arc::clone(&self.state);
+        let client = self.client.clone();
+
+        tokio::spawn(async move {
+            tokio::time::sleep(REINDEX_DEBOUNCE).await;
+            // 自分が最後のトリガーだった場合のみ実行する。
+            // 後続トリガーが来ていれば generation は my_gen より大きい。
+            if generation.load(Ordering::SeqCst) == my_gen {
+                reindex(state, client).await;
+            }
+        });
     }
 }
 
@@ -192,7 +233,7 @@ impl LanguageServer for Backend {
     // 更新しない。保存時はディスクが最新になるので、ここで索引を作り直し、
     // シンボルの増減やリンク解決の変化を全ドキュメントの診断に反映する。
     async fn did_save(&self, _params: DidSaveTextDocumentParams) {
-        tokio::spawn(reindex(Arc::clone(&self.state), self.client.clone()));
+        self.schedule_reindex();
     }
 
     // --- 増分更新（M4 4-2）: エディタ外のファイル変更に追従する ---
@@ -202,7 +243,7 @@ impl LanguageServer for Backend {
     // クライアント（拡張）側の FileSystemWatcher が監視対象を購読しているため、
     // 該当ファイルが変わるとこの通知が来る。保存時と同じく索引を作り直す。
     async fn did_change_watched_files(&self, _params: DidChangeWatchedFilesParams) {
-        tokio::spawn(reindex(Arc::clone(&self.state), self.client.clone()));
+        self.schedule_reindex();
     }
 
     // --- DocumentLink（2-3） ---
@@ -860,6 +901,7 @@ async fn main() {
     let (service, socket) = LspService::new(|client| Backend {
         client,
         state: Arc::new(RwLock::new(State::new())),
+        reindex_generation: Arc::new(AtomicU64::new(0)),
     });
 
     Server::new(stdin, stdout, socket).serve(service).await;
