@@ -195,6 +195,16 @@ impl LanguageServer for Backend {
         tokio::spawn(reindex(Arc::clone(&self.state), self.client.clone()));
     }
 
+    // --- 増分更新（M4 4-2）: エディタ外のファイル変更に追従する ---
+    //
+    // git checkout、外部エディタでの編集、ファイルの新規作成/削除など、
+    // VS Code のドキュメント編集を経由しない変更はここに届く。
+    // クライアント（拡張）側の FileSystemWatcher が監視対象を購読しているため、
+    // 該当ファイルが変わるとこの通知が来る。保存時と同じく索引を作り直す。
+    async fn did_change_watched_files(&self, _params: DidChangeWatchedFilesParams) {
+        tokio::spawn(reindex(Arc::clone(&self.state), self.client.clone()));
+    }
+
     // --- DocumentLink（2-3） ---
 
     async fn document_link(&self, params: DocumentLinkParams) -> Result<Option<Vec<DocumentLink>>> {
