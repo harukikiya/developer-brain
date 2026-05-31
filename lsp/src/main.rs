@@ -35,7 +35,7 @@ use std::sync::Arc;
 use dbrain_core::index::{
     index_workspace, parse_links_with_ranges, ReferenceResolution, WorkspaceIndex,
 };
-use dbrain_core::model::{NodeId, RelPath, SymbolEntry, SymbolKind};
+use dbrain_core::model::{Edge, NodeId, RelPath, SymbolEntry, SymbolKind};
 use tokio::sync::RwLock;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
@@ -110,6 +110,16 @@ impl LanguageServer for Backend {
                 }),
                 definition_provider: Some(OneOf::Left(true)),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
+                // `[` をトリガーにすると `[[` を打った瞬間に補完が起動する。
+                completion_provider: Some(CompletionOptions {
+                    trigger_characters: Some(vec!["[".to_string()]),
+                    resolve_provider: Some(false),
+                    ..Default::default()
+                }),
+                // CodeLens: シンボル定義行に被参照数を表示する（resolve なし）。
+                code_lens_provider: Some(CodeLensOptions {
+                    resolve_provider: Some(false),
+                }),
                 ..Default::default()
             },
         })
@@ -299,6 +309,169 @@ impl LanguageServer for Backend {
             range: Some(core_range_to_lsp(link_range, content)),
         }))
     }
+
+    // --- 補完（2-6） ---
+    //
+    // `[[` を打った瞬間に起動し、ドキュメント名とコードシンボルを候補として返す。
+    // TextEdit で「`[[` の直後〜カーソル」を置換するため、途中まで打っていても
+    // 正しく上書きされる。
+
+    async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
+        let pos = params.text_document_position.position;
+        let s = self.state.read().await;
+        let (Some(index), Some(content)) = (
+            &s.index,
+            s.docs.get(&params.text_document_position.text_document.uri),
+        ) else {
+            return Ok(None);
+        };
+
+        // カーソル行を取得し、`[[` の中にいるか確認する。
+        let line = content.lines().nth(pos.line as usize).unwrap_or("");
+        let cursor_byte = utf16_col_to_byte_offset(line, pos.character);
+        let before_cursor = &line[..cursor_byte.min(line.len())];
+
+        // 最後の `[[` を探し、`]]` で既に閉じられていれば補完しない。
+        let Some(bracket_pos) = before_cursor.rfind("[[") else {
+            return Ok(None);
+        };
+        let after_bracket = &before_cursor[bracket_pos + 2..];
+        if after_bracket.contains("]]") {
+            return Ok(None);
+        }
+
+        // `[[` 直後〜カーソル位置 を TextEdit の置換範囲にする。
+        let bracket_end_utf16 = str_to_utf16_col(&line[..bracket_pos + 2]);
+        let replace_range = Range {
+            start: Position {
+                line: pos.line,
+                character: bracket_end_utf16,
+            },
+            end: pos,
+        };
+
+        let mut items: Vec<CompletionItem> = Vec::new();
+
+        // ドキュメント候補（フルパス）。
+        for doc_path in &index.doc_paths {
+            items.push(CompletionItem {
+                label: doc_path.clone(),
+                kind: Some(CompletionItemKind::FILE),
+                text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                    range: replace_range,
+                    new_text: format!("{doc_path}]]"),
+                })),
+                ..Default::default()
+            });
+        }
+
+        // ドキュメント短縮名（一意なもののみ）。
+        for (stem, path_opt) in &index.doc_by_stem {
+            let Some(full_path) = path_opt else { continue };
+            items.push(CompletionItem {
+                label: stem.clone(),
+                kind: Some(CompletionItemKind::FILE),
+                // detail にフルパスを出すことで候補一覧でファイルパスが見える。
+                detail: Some(full_path.0.clone()),
+                text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                    range: replace_range,
+                    new_text: format!("{stem}]]"),
+                })),
+                ..Default::default()
+            });
+        }
+
+        // コードシンボル候補（`file.rs@Mod::Sym` 形式）。
+        for (_, entry) in index.symbols.iter() {
+            let qualified = entry.descriptor.path.0.join("::");
+            let label = format!("{}@{}", entry.descriptor.file.0, qualified);
+            let kind = entry.descriptor.kind.map(symbol_kind_to_completion_kind);
+            items.push(CompletionItem {
+                label: label.clone(),
+                kind,
+                text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                    range: replace_range,
+                    new_text: format!("{label}]]"),
+                })),
+                ..Default::default()
+            });
+        }
+
+        Ok(if items.is_empty() {
+            None
+        } else {
+            Some(CompletionResponse::Array(items))
+        })
+    }
+
+    // --- CodeLens（2-7） ---
+    //
+    // ソースファイル内の各シンボル定義行に「N 件の参照」を表示する。
+    // グラフの References 辺を集計するだけなので O(辺数)。
+
+    async fn code_lens(&self, params: CodeLensParams) -> Result<Option<Vec<CodeLens>>> {
+        let s = self.state.read().await;
+        let (Some(index), Some(root)) = (&s.index, &s.root) else {
+            return Ok(None);
+        };
+
+        // URI をワークスペース相対パスに変換する。
+        let Some(abs_path) = params.text_document.uri.to_file_path().ok() else {
+            return Ok(None);
+        };
+        let Some(rel) = abs_path.strip_prefix(root).ok() else {
+            return Ok(None);
+        };
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+
+        // References 辺を走査してシンボル ID → 参照数のマップを作る。
+        let mut ref_counts: std::collections::HashMap<dbrain_core::model::SymbolId, usize> =
+            std::collections::HashMap::new();
+        for edge in index.graph.edges() {
+            if let Edge::References {
+                to: NodeId::Symbol(id),
+                ..
+            } = edge
+            {
+                *ref_counts.entry(*id).or_insert(0) += 1;
+            }
+        }
+
+        let lenses: Vec<CodeLens> = index
+            .symbols
+            .iter()
+            .filter(|(_, e)| e.descriptor.file.0 == rel_str)
+            .filter_map(|(id, entry)| {
+                // 参照が 0 件（マップに無い）はレンズを出さない。
+                let count = *ref_counts.get(&id)?;
+                let range = Range {
+                    start: Position {
+                        line: entry.name_range.start.line,
+                        character: entry.name_range.start.character,
+                    },
+                    end: Position {
+                        line: entry.name_range.end.line,
+                        character: entry.name_range.end.character,
+                    },
+                };
+                Some(CodeLens {
+                    range,
+                    command: Some(Command {
+                        title: format!("{count} 件の参照"),
+                        command: String::new(), // 今はクリック動作なし（表示のみ）
+                        arguments: None,
+                    }),
+                    data: None,
+                })
+            })
+            .collect();
+
+        Ok(if lenses.is_empty() {
+            None
+        } else {
+            Some(lenses)
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -473,6 +646,49 @@ fn symbol_kind_str(kind: SymbolKind) -> &'static str {
         SymbolKind::Variable => "var",
         SymbolKind::Macro => "macro!",
         SymbolKind::Module => "mod",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 補完ヘルパ（2-6）
+// ---------------------------------------------------------------------------
+
+/// LSP の UTF-16 列番号を行テキスト内のバイトオフセットに変換する。
+///
+/// 補完の `position` は UTF-16 単位で届くが、Rust の文字列操作はバイト単位なので変換が要る。
+fn utf16_col_to_byte_offset(line: &str, utf16_col: u32) -> usize {
+    let mut col = 0u32;
+    let mut byte_offset = 0;
+    for ch in line.chars() {
+        if col >= utf16_col {
+            break;
+        }
+        col += ch.len_utf16() as u32;
+        byte_offset += ch.len_utf8();
+    }
+    byte_offset
+}
+
+/// 文字列の先頭から末尾までの UTF-16 code unit 数を返す。
+///
+/// TextEdit の範囲計算で「`[[` の直後の UTF-16 列番号」を求めるために使う。
+fn str_to_utf16_col(s: &str) -> u32 {
+    s.chars().map(|c| c.len_utf16() as u32).sum()
+}
+
+/// [`SymbolKind`] を LSP の [`CompletionItemKind`] に対応付ける。
+fn symbol_kind_to_completion_kind(kind: SymbolKind) -> CompletionItemKind {
+    match kind {
+        SymbolKind::Function | SymbolKind::Method => CompletionItemKind::FUNCTION,
+        SymbolKind::Struct | SymbolKind::Enum | SymbolKind::Trait | SymbolKind::Type => {
+            CompletionItemKind::CLASS
+        }
+        SymbolKind::Const | SymbolKind::Static => CompletionItemKind::CONSTANT,
+        SymbolKind::Field => CompletionItemKind::FIELD,
+        SymbolKind::Variant => CompletionItemKind::ENUM_MEMBER,
+        SymbolKind::Variable => CompletionItemKind::VARIABLE,
+        SymbolKind::Macro => CompletionItemKind::KEYWORD,
+        SymbolKind::Module => CompletionItemKind::MODULE,
     }
 }
 
