@@ -1,4 +1,4 @@
-//! # 索引器（M1）: Markdown を知識グラフに変換する
+//! # 索引器（M1/M2）: Markdown を知識グラフに変換し、LSP に知識を提供する
 //!
 //! このモジュールは「ワークスペースを走査して知識グラフを組み立てる」役割。
 //! - `.md` を走査し、見出し（Section）とドキュメント（Doc）をノードにする。
@@ -10,6 +10,10 @@
 //! 解析は純粋関数に** 分ける。[`index_document`] は文字列を受け取る純粋関数で、
 //! ファイルシステムに触れない＝テストしやすい。走査 [`index_workspace`] は
 //! それを呼ぶ薄いラッパ。
+//!
+//! M2 で追加した [`parse_links_with_ranges`] は、LSP の DocumentLink/Hover/診断が
+//! 必要とする「リンク＋ソース上の位置」を live で返す純粋関数。位置はグラフに
+//! 保存しない（「参照は座標ではなくクエリ」の原則）——要求のたびに計算し直す。
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -18,7 +22,9 @@ use std::path::Path;
 use serde::Serialize;
 
 use crate::code::{extract_symbols, SymbolTable};
-use crate::model::{DocTarget, Edge, NodeId, Reference, RelPath, Resolution, SymbolDescriptor};
+use crate::model::{
+    self, DocTarget, Edge, NodeId, Reference, RelPath, Resolution, SymbolDescriptor,
+};
 
 /// 1 つのドキュメントを解析した結果（位置を持たない中間表現）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -232,8 +238,170 @@ impl KnowledgeGraph {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ワークスペース索引の結果をまとめる型
+// ---------------------------------------------------------------------------
+
+/// [`index_workspace`] が返す索引結果。グラフ・シンボル表・ドキュメントパス集合を束ねる。
+///
+/// LSP サーバは起動後にこれを 1 つ保持し、DocumentLink/Hover/補完/診断の
+/// 基盤として使う。グラフには位置を保存しない（「参照はクエリ」の原則）ため、
+/// 各リクエスト時に [`parse_links_with_ranges`] で live 計算する。
+pub struct WorkspaceIndex {
+    /// ノードと辺からなる知識グラフ。グラフビュー・逆参照 CodeLens に使う。
+    pub graph: KnowledgeGraph,
+    /// コードシンボルの解決表。`[[file.rs@Sym]]` を解決するときに問い合わせる。
+    pub symbols: SymbolTable,
+    /// ワークスペース内の全 `.md` パス集合（相対パス・`/` 区切り）。
+    /// DocumentLink でリンク先が実在するか確認するための高速ルックアップ用。
+    pub doc_paths: HashSet<String>,
+    /// ファイル名ステム（拡張子・ディレクトリなし）→ パス。
+    /// 一意に定まる場合は `Some(path)`、同名が複数ある場合は `None`（短縮名解決用）。
+    /// 例: `"spec"` → `Some(RelPath("docs/spec.md"))` なら `[[spec]]` が解決できる。
+    pub doc_by_stem: HashMap<String, Option<RelPath>>,
+}
+
+/// [`WorkspaceIndex::resolve_reference`] が返す解決結果。
+///
+/// この型は `dbrain-core` 側に置く——「賢さはコアに」の原則より、
+/// LSP / MCP / CLI が同じロジックを重複実装しないよう共有する。
+/// エディタ側アダプタはこれをパターンマッチして各プロトコルの型に変換するだけでよい。
+#[derive(Debug)]
+pub enum ReferenceResolution {
+    /// ドキュメントリンクが一意に解決できた。
+    DocResolved(RelPath),
+    /// 同名ステムが複数あり、どのドキュメントか一意に定まらない。
+    /// フルパス指定に直すよう案内する。
+    DocAmbiguous,
+    /// 対応するドキュメントが存在しない。
+    DocDangling,
+    /// コードシンボルが一意に解決できた。`id` で [`SymbolTable::get`] を引ける。
+    CodeResolved { id: crate::model::SymbolId },
+    /// 同名・同パスのシンボルが複数（C++ オーバーロード等）。
+    CodeAmbiguous(Vec<crate::model::SymbolId>),
+    /// 対応するシンボルが見つからない（リネームや削除後の dangling 参照）。
+    CodeDangling,
+}
+
+impl WorkspaceIndex {
+    /// `[[...]]` 参照を索引に照らして解決する。
+    ///
+    /// エディタ機能（DocumentLink・GotoDefinition・Hover・診断）はこれを呼び、
+    /// 返り値をパターンマッチして各プロトコルの型に変換する。
+    /// 解決ロジックが 1 か所に集約されるため、LSP・MCP・CLI で実装を重複させない。
+    pub fn resolve_reference(&self, reference: &Reference) -> ReferenceResolution {
+        match reference {
+            Reference::Doc { target, .. } => match target {
+                DocTarget::Path(p) => {
+                    if self.doc_paths.contains(&p.0) {
+                        ReferenceResolution::DocResolved(p.clone())
+                    } else {
+                        ReferenceResolution::DocDangling
+                    }
+                }
+                DocTarget::Name(name) => match self.doc_by_stem.get(name.as_str()) {
+                    Some(Some(path)) => ReferenceResolution::DocResolved(path.clone()),
+                    Some(None) => ReferenceResolution::DocAmbiguous,
+                    None => ReferenceResolution::DocDangling,
+                },
+            },
+            Reference::Code(desc) => match self.symbols.resolve(desc) {
+                Resolution::Resolved { id, .. } => ReferenceResolution::CodeResolved { id },
+                Resolution::Ambiguous(ids) => ReferenceResolution::CodeAmbiguous(ids),
+                Resolution::Dangling => ReferenceResolution::CodeDangling,
+            },
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 位置付きリンク抽出（LSP の DocumentLink / Hover / 診断向け）
+// ---------------------------------------------------------------------------
+
+/// ドキュメント内の `[[...]]` を **ソース上の位置付き** で抽出する。
+///
+/// グラフ（[`KnowledgeGraph`]）には位置を保存しない——「参照は座標ではなくクエリ」の
+/// 原則に従い、位置は要求のたびに live で計算し直す（`CLAUDE.md` 不変条件①）。
+/// この関数はその live 計算の実体であり、LSP ハンドラから毎回呼ばれることを前提にする。
+///
+/// - コードブロック・インラインコード内の `[[...]]` は除外する（[`index_document`] と同じ）。
+/// - フロントマターを除去してから解析するが、返す位置はフロントマターを含む
+///   **ドキュメント全体** の行・文字位置（LSP が扱うのはファイル全体のため）。
+/// - 文字位置は UTF-8 コードポイント数（Rust の `char` 数）。LSP が要求する
+///   UTF-16 単位への変換は `lsp` クレートの責務。
+pub fn parse_links_with_ranges(content: &str) -> Vec<(Reference, model::Range)> {
+    use pulldown_cmark::{Event, Parser, Tag};
+
+    let body = strip_frontmatter(content);
+    // body は content の末尾スライス。ポインタ差でフロントマターのバイト数を得る。
+    // Safety: body は content のサブスライスが保証されている（strip_frontmatter の実装より）。
+    let fm_bytes = body.as_ptr() as usize - content.as_ptr() as usize;
+
+    // body 上のコードブロック・インラインコードの範囲を収集する（index_document と同じ手順）。
+    let mut code_ranges: Vec<Range<usize>> = Vec::new();
+    let mut codeblock_start: Option<usize> = None;
+    for (event, range) in Parser::new(body).into_offset_iter() {
+        match event {
+            Event::Start(Tag::CodeBlock(_)) => codeblock_start = Some(range.start),
+            Event::End(Tag::CodeBlock(_)) => {
+                if let Some(s) = codeblock_start.take() {
+                    code_ranges.push(s..range.end);
+                }
+            }
+            Event::Code(_) => code_ranges.push(range),
+            _ => {}
+        }
+    }
+
+    // body をバイト走査して [[...]] を見つけ、位置を付けて返す。
+    let bytes = body.as_bytes();
+    let mut result = Vec::new();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'[' && bytes[i + 1] == b'[' {
+            let inner_start = i + 2;
+            if let Some(off) = find_subslice(&bytes[inner_start..], b"]]") {
+                let inner_end = inner_start + off;
+                if !in_any_range(i, &code_ranges) {
+                    if let Ok(inner) = std::str::from_utf8(&bytes[inner_start..inner_end]) {
+                        let inner = inner.trim();
+                        if !inner.is_empty() && !inner.contains('\n') {
+                            // body 上のオフセット → content 上の絶対オフセット に変換。
+                            let abs_start = fm_bytes + i;
+                            let abs_end = fm_bytes + inner_end + 2; // `]]` の直後
+                            let start = byte_offset_to_position(content, abs_start);
+                            let end = byte_offset_to_position(content, abs_end);
+                            result.push((Reference::parse(inner), model::Range { start, end }));
+                        }
+                    }
+                }
+                i = inner_end + 2;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    result
+}
+
+/// バイトオフセット → 行・文字位置（0 始まり）に変換するヘルパ。
+///
+/// 「文字」は UTF-8 コードポイント数（Rust の `char` 数）。
+/// LSP の UTF-16 変換は LSP アダプタ層で行う。
+fn byte_offset_to_position(text: &str, byte_offset: usize) -> model::Position {
+    let prefix = &text[..byte_offset.min(text.len())];
+    let line = prefix.bytes().filter(|&b| b == b'\n').count() as u32;
+    let last_nl = prefix.rfind('\n').map(|p| p + 1).unwrap_or(0);
+    let character = prefix[last_nl..].chars().count() as u32;
+    model::Position { line, character }
+}
+
+// ---------------------------------------------------------------------------
+// ワークスペース全体の索引
+// ---------------------------------------------------------------------------
+
 /// ワークスペースを走査して知識グラフを組み立てる。
-pub fn index_workspace(root: &Path) -> KnowledgeGraph {
+pub fn index_workspace(root: &Path) -> WorkspaceIndex {
     let mut graph = KnowledgeGraph::new();
 
     // --- pass 0: ソース（Rust/C）からシンボル表を作り、Symbol ノードを追加 ---
@@ -315,7 +483,12 @@ pub fn index_workspace(root: &Path) -> KnowledgeGraph {
         }
     }
 
-    graph
+    WorkspaceIndex {
+        graph,
+        symbols,
+        doc_paths,
+        doc_by_stem: stem_to_path,
+    }
 }
 
 /// Symbol ノードの表示ラベル（記述子そのものを読める形に）。例: `core/src/model.rs@SymbolDescriptor`。
@@ -748,9 +921,9 @@ mod tests {
         .unwrap();
         fs::write(dir.join("doc.md"), "詳細は [[lib.rs@Foo::bar]] を参照。\n").unwrap();
 
-        let g = index_workspace(&dir);
-        assert_eq!(g.code_refs_resolved, 1);
-        assert_eq!(g.code_refs_unresolved, 0);
+        let idx = index_workspace(&dir);
+        assert_eq!(idx.graph.code_refs_resolved, 1);
+        assert_eq!(idx.graph.code_refs_unresolved, 0);
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -765,10 +938,55 @@ mod tests {
         fs::write(dir.join("lib.rs"), "pub fn exists() {}\n").unwrap();
         fs::write(dir.join("doc.md"), "[[lib.rs@does_not_exist]]\n").unwrap();
 
-        let g = index_workspace(&dir);
-        assert_eq!(g.code_refs_resolved, 0);
-        assert_eq!(g.code_refs_unresolved, 1);
+        let idx = index_workspace(&dir);
+        assert_eq!(idx.graph.code_refs_resolved, 0);
+        assert_eq!(idx.graph.code_refs_unresolved, 1);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ----- parse_links_with_ranges / byte_offset_to_position -----
+
+    /// 観点: `[[...]]` の開始・終了位置が行・文字単位で正しく計算されること。
+    /// "See [[other.md]] for details." の `[[` は行 2 の文字 4 から始まる。
+    #[test]
+    fn parse_links_with_ranges_returns_positions() {
+        let md = "# Head\n\nSee [[other.md]] for details.\n";
+        let links = parse_links_with_ranges(md);
+        assert_eq!(links.len(), 1, "リンクが 1 件抽出されること");
+        // "See " は 4 文字なので [[other.md]] の開始は char 4。
+        assert_eq!(links[0].1.start.line, 2);
+        assert_eq!(links[0].1.start.character, 4);
+        // "[[other.md]]" は 12 文字なので終了は char 16。
+        assert_eq!(links[0].1.end.line, 2);
+        assert_eq!(links[0].1.end.character, 16);
+    }
+
+    /// 観点: フロントマターの行数が位置に正しく加算されること。
+    /// フロントマター 3 行（0-2）＋空行（3）＋"# Head"（4）＋空行（5）＋本文（6）。
+    #[test]
+    fn parse_links_with_ranges_accounts_for_frontmatter() {
+        let md = "---\ntitle: x\n---\n\n# Head\n\nSee [[other.md]].\n";
+        let links = parse_links_with_ranges(md);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].1.start.line, 6, "フロントマター 3 行分ずれること");
+        assert_eq!(links[0].1.start.character, 4);
+    }
+
+    /// 観点: コードブロック内の `[[...]]` は位置付き抽出でも除外されること。
+    #[test]
+    fn parse_links_with_ranges_excludes_code_blocks() {
+        let md = "本文 [[real.md]]\n\n```\n[[not-a-link.md]]\n```\n";
+        let links = parse_links_with_ranges(md);
+        assert_eq!(links.len(), 1);
+        match &links[0].0 {
+            Reference::Doc {
+                target: DocTarget::Path(p),
+                ..
+            } => {
+                assert_eq!(p.0, "real.md")
+            }
+            other => panic!("expected doc link to real.md, got {other:?}"),
+        }
     }
 }

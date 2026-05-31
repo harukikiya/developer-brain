@@ -76,12 +76,12 @@ fn symbol_nodes(g: &KnowledgeGraph) -> usize {
 fn vp1_rust_symbols() {
     let ws = TempWs::new("vp1");
     ws.write("lib.rs", "pub struct Foo;\nimpl Foo { pub fn bar() {} }\n");
-    let g = index_workspace(ws.path());
+    let idx = index_workspace(ws.path());
     // Foo（struct）と Foo::bar（method）の 2 つは少なくとも出る。
     assert!(
-        symbol_nodes(&g) >= 2,
+        symbol_nodes(&idx.graph) >= 2,
         "expected >=2 symbols, got {}",
-        symbol_nodes(&g)
+        symbol_nodes(&idx.graph)
     );
 }
 
@@ -94,12 +94,12 @@ fn vp2_c_symbols() {
         "mod.c",
         "static int g_count;\nstruct Point { int x; };\nvoid run(void) {}\n",
     );
-    let g = index_workspace(ws.path());
+    let idx = index_workspace(ws.path());
     // g_count（Static）/ Point（Struct）/ run（Function）の 3 つ。
     assert!(
-        symbol_nodes(&g) >= 3,
+        symbol_nodes(&idx.graph) >= 3,
         "expected >=3 C symbols, got {}",
-        symbol_nodes(&g)
+        symbol_nodes(&idx.graph)
     );
 }
 
@@ -110,10 +110,13 @@ fn vp3_doc_to_code_resolved() {
     let ws = TempWs::new("vp3");
     ws.write("lib.rs", "pub struct Foo;\nimpl Foo { pub fn bar() {} }\n");
     ws.write("doc.md", "詳細は [[lib.rs@Foo::bar]] を参照。\n");
-    let g = index_workspace(ws.path());
-    assert_eq!(g.code_refs_resolved, 1);
-    assert_eq!(g.code_refs_unresolved, 0);
-    assert_eq!(count_edges(&g, |e| matches!(e, Edge::References { .. })), 1);
+    let idx = index_workspace(ws.path());
+    assert_eq!(idx.graph.code_refs_resolved, 1);
+    assert_eq!(idx.graph.code_refs_unresolved, 0);
+    assert_eq!(
+        count_edges(&idx.graph, |e| matches!(e, Edge::References { .. })),
+        1
+    );
 }
 
 // --- 観点 4: dangling（解決不能） ---
@@ -123,10 +126,13 @@ fn vp4_dangling() {
     let ws = TempWs::new("vp4");
     ws.write("lib.rs", "pub fn exists() {}\n");
     ws.write("doc.md", "[[lib.rs@does_not_exist]]\n");
-    let g = index_workspace(ws.path());
-    assert_eq!(g.code_refs_resolved, 0);
-    assert_eq!(g.code_refs_unresolved, 1);
-    assert_eq!(count_edges(&g, |e| matches!(e, Edge::References { .. })), 0);
+    let idx = index_workspace(ws.path());
+    assert_eq!(idx.graph.code_refs_resolved, 0);
+    assert_eq!(idx.graph.code_refs_unresolved, 1);
+    assert_eq!(
+        count_edges(&idx.graph, |e| matches!(e, Edge::References { .. })),
+        0
+    );
 }
 
 // --- 観点 5: doc→doc リンクと短縮名 ---
@@ -137,9 +143,12 @@ fn vp5_doc_links_and_shortname() {
     // a.md からフルパス [[b.md]] と短縮名 [[b]] の両方で b.md を指す。
     ws.write("a.md", "見る: [[b.md]] と [[b]]\n");
     ws.write("b.md", "# B\n");
-    let g = index_workspace(ws.path());
+    let idx = index_workspace(ws.path());
     // 2 本とも b.md に解決し、Links 辺が 2 本張られる。
-    assert_eq!(count_edges(&g, |e| matches!(e, Edge::Links { .. })), 2);
+    assert_eq!(
+        count_edges(&idx.graph, |e| matches!(e, Edge::Links { .. })),
+        2
+    );
 }
 
 // --- 観点 6: 行ズレ耐性（このツールの設計の核心） ---
@@ -221,15 +230,18 @@ fn vp8_mixed_workspace() {
         "spec.md",
         "Rust 側 [[lib.rs@rust_fn]] と C 側 [[driver.c@c_fn]] を参照。\n",
     );
-    let g = index_workspace(ws.path());
+    let idx = index_workspace(ws.path());
 
     // 両言語のシンボルが 1 つのグラフに同居し、両方の参照が解決する。
-    assert!(symbol_nodes(&g) >= 2);
-    assert_eq!(g.code_refs_resolved, 2);
-    assert_eq!(count_edges(&g, |e| matches!(e, Edge::References { .. })), 2);
+    assert!(symbol_nodes(&idx.graph) >= 2);
+    assert_eq!(idx.graph.code_refs_resolved, 2);
+    assert_eq!(
+        count_edges(&idx.graph, |e| matches!(e, Edge::References { .. })),
+        2
+    );
 
     // doc ノードと section ノードも含まれる（包含関係の確認）。
-    assert!(g.node_ids().any(|n| matches!(n, NodeId::Doc(_))));
+    assert!(idx.graph.node_ids().any(|n| matches!(n, NodeId::Doc(_))));
 }
 
 // --- 観点 9: C のメンバ粒度（フィールド・列挙子の解決） ---
@@ -243,10 +255,13 @@ fn vp9_c_member_granularity() {
     );
     // フィールドは Tag::field、列挙子は C のグローバルに忠実に単独名で参照する。
     ws.write("doc.md", "座標 [[geo.c@Point::x]] と色 [[geo.c@RED]]。\n");
-    let g = index_workspace(ws.path());
-    assert_eq!(g.code_refs_resolved, 2);
-    assert_eq!(g.code_refs_unresolved, 0);
-    assert_eq!(count_edges(&g, |e| matches!(e, Edge::References { .. })), 2);
+    let idx = index_workspace(ws.path());
+    assert_eq!(idx.graph.code_refs_resolved, 2);
+    assert_eq!(idx.graph.code_refs_unresolved, 0);
+    assert_eq!(
+        count_edges(&idx.graph, |e| matches!(e, Edge::References { .. })),
+        2
+    );
 }
 
 // --- 観点 10: Rust のメンバ粒度（フィールド・バリアントの解決） ---
@@ -263,8 +278,11 @@ fn vp10_rust_member_granularity() {
         "doc.md",
         "設定 [[cfg.rs@Config::timeout]] と状態 [[cfg.rs@State::Idle]]。\n",
     );
-    let g = index_workspace(ws.path());
-    assert_eq!(g.code_refs_resolved, 2);
-    assert_eq!(g.code_refs_unresolved, 0);
-    assert_eq!(count_edges(&g, |e| matches!(e, Edge::References { .. })), 2);
+    let idx = index_workspace(ws.path());
+    assert_eq!(idx.graph.code_refs_resolved, 2);
+    assert_eq!(idx.graph.code_refs_unresolved, 0);
+    assert_eq!(
+        count_edges(&idx.graph, |e| matches!(e, Edge::References { .. })),
+        2
+    );
 }

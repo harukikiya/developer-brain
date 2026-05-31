@@ -15,82 +15,738 @@
 //!
 //! 索引やリンク解決の本体は `dbrain-core` 側にあります。ここは
 //! 「LSP のリクエストを受け取り、コアに渡し、結果を LSP の形に直して返す」
-//! という通訳に徹します。賢さはコアに、礼儀作法（プロトコル）はここに、
-//! と責務を分けておくと、後で MCP など別の入口を足すのが楽になります。
+//! という通訳に徹します。賢さはコアに、礼儀作法（プロトコル）はここに。
 //!
-//! ## M0 の到達点
+//! ## M2 の実装内容
 //!
-//! いまは `initialize`（握手）に応答するだけの最小サーバです。
-//! M2 で `completion`（`[[` 補完）・`document_link`（リンクジャンプ）・
-//! `hover`・`code_lens`（逆参照表示）をここに足していきます。
+//! | サブタスク | 機能 |
+//! |-----------|------|
+//! | 2-1+2-2 | 状態管理・索引読み込み・ドキュメント追跡 |
+//! | 2-3 | DocumentLink + GotoDefinition |
+//! | 2-4 | 診断（Dangling / Ambiguous の波線）|
+//! | 2-5 | Hover |
+//! | 2-6 | `[[` 補完 |
+//! | 2-7 | CodeLens（逆参照数）|
 
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use dbrain_core::index::{
+    index_workspace, parse_links_with_ranges, ReferenceResolution, WorkspaceIndex,
+};
+use dbrain_core::model::{Edge, NodeId, RelPath, SymbolEntry, SymbolKind};
+use tokio::sync::RwLock;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
-/// サーバの状態を持つ構造体。
-///
-/// `client` はサーバからエディタへ「話しかける」ための窓口
-/// （ログ送信・通知・診断のプッシュなどに使う）。M1 以降はここに
-/// 索引（`dbrain-core` のグラフ）を保持するフィールドが増えていく。
-#[derive(Debug)]
-struct Backend {
-    client: Client,
+// ---------------------------------------------------------------------------
+// 共有状態
+// ---------------------------------------------------------------------------
+
+/// LSP サーバの共有状態。`Arc<RwLock<State>>` で複数の非同期ハンドラから安全に共有する。
+struct State {
+    root: Option<PathBuf>,
+    /// 索引結果。None = まだ索引中。
+    index: Option<WorkspaceIndex>,
+    /// 開いているファイルのテキストバッファ（URI → 全文）。FULL 同期で上書き。
+    docs: HashMap<Url, String>,
 }
 
-// `#[tower_lsp::async_trait]` は、トレイトのメソッドを async にするための
-// おまじない（Rust 標準ではトレイトの async メソッドに少し制約があるため）。
+impl State {
+    fn new() -> Self {
+        Self {
+            root: None,
+            index: None,
+            docs: HashMap::new(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// サーバ本体
+// ---------------------------------------------------------------------------
+
+struct Backend {
+    client: Client,
+    state: Arc<RwLock<State>>,
+}
+
+impl std::fmt::Debug for Backend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Backend").finish_non_exhaustive()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LSP ハンドラ
+// ---------------------------------------------------------------------------
+
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
-    /// 握手。クライアントが最初に一度だけ呼ぶ。
-    ///
-    /// サーバは「自分は何者で、どんな機能(capabilities)を提供できるか」を
-    /// 返す。ここで宣言した機能だけがエディタから呼ばれるようになる。
-    async fn initialize(&self, _params: InitializeParams) -> Result<InitializeResult> {
+    async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
+        let root = params
+            .root_uri
+            .as_ref()
+            .and_then(|uri| uri.to_file_path().ok());
+        {
+            let mut s = self.state.write().await;
+            s.root = root;
+        }
+
         Ok(InitializeResult {
-            // サーバ名とバージョン（バージョンはビルド時に Cargo.toml から取る）。
             server_info: Some(ServerInfo {
                 name: "developer-brain-lsp".to_string(),
                 version: Some(env!("CARGO_PKG_VERSION").to_string()),
             }),
             capabilities: ServerCapabilities {
-                // 文書の変更を「差分(INCREMENTAL)」で受け取る宣言。
-                // 全文ではなく変わった部分だけ届くので、大きなファイルでも軽い。
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
-                    TextDocumentSyncKind::INCREMENTAL,
+                    TextDocumentSyncKind::FULL,
                 )),
-                // M2 でここに completion_provider / document_link_provider /
-                // hover_provider / code_lens_provider を追加する。
+                document_link_provider: Some(DocumentLinkOptions {
+                    resolve_provider: Some(false),
+                    work_done_progress_options: Default::default(),
+                }),
+                definition_provider: Some(OneOf::Left(true)),
+                hover_provider: Some(HoverProviderCapability::Simple(true)),
+                // `[` をトリガーにすると `[[` を打った瞬間に補完が起動する。
+                completion_provider: Some(CompletionOptions {
+                    trigger_characters: Some(vec!["[".to_string()]),
+                    resolve_provider: Some(false),
+                    ..Default::default()
+                }),
+                // CodeLens: シンボル定義行に被参照数を表示する（resolve なし）。
+                code_lens_provider: Some(CodeLensOptions {
+                    resolve_provider: Some(false),
+                }),
                 ..Default::default()
             },
         })
     }
 
-    /// 握手が完了した直後に呼ばれる通知。ログを 1 行出すだけ。
     async fn initialized(&self, _params: InitializedParams) {
         self.client
             .log_message(MessageType::INFO, "developer-brain-lsp initialized")
             .await;
+
+        let root = {
+            let s = self.state.read().await;
+            s.root.clone()
+        };
+
+        if let Some(root) = root {
+            let state_arc = Arc::clone(&self.state);
+            let client = self.client.clone();
+
+            tokio::spawn(async move {
+                client
+                    .log_message(MessageType::INFO, "developer-brain: indexing workspace...")
+                    .await;
+
+                let result = tokio::task::spawn_blocking(move || index_workspace(&root)).await;
+
+                match result {
+                    Ok(index) => {
+                        let msg = format!(
+                            "developer-brain: indexed {} nodes, {} edges",
+                            index.graph.node_count(),
+                            index.graph.edge_count(),
+                        );
+                        let open_uris: Vec<Url> = {
+                            let mut s = state_arc.write().await;
+                            let uris = s.docs.keys().cloned().collect();
+                            s.index = Some(index);
+                            uris
+                        };
+                        client.log_message(MessageType::INFO, msg).await;
+                        for uri in open_uris {
+                            push_diagnostics(&uri, &state_arc, &client).await;
+                        }
+                    }
+                    Err(e) => {
+                        client
+                            .log_message(
+                                MessageType::ERROR,
+                                format!("developer-brain: indexing failed: {e}"),
+                            )
+                            .await;
+                    }
+                }
+            });
+        }
     }
 
-    /// 終了要求。後片付けがあればここで行う（今は何もない）。
     async fn shutdown(&self) -> Result<()> {
         Ok(())
     }
+
+    // --- ドキュメント追跡（2-2） ---
+
+    async fn did_open(&self, params: DidOpenTextDocumentParams) {
+        let uri = params.text_document.uri.clone();
+        {
+            let mut s = self.state.write().await;
+            s.docs.insert(uri.clone(), params.text_document.text);
+        }
+        push_diagnostics(&uri, &self.state, &self.client).await;
+    }
+
+    async fn did_change(&self, params: DidChangeTextDocumentParams) {
+        let uri = params.text_document.uri.clone();
+        if let Some(change) = params.content_changes.into_iter().last() {
+            let mut s = self.state.write().await;
+            s.docs.insert(uri.clone(), change.text);
+        }
+        push_diagnostics(&uri, &self.state, &self.client).await;
+    }
+
+    async fn did_close(&self, params: DidCloseTextDocumentParams) {
+        let mut s = self.state.write().await;
+        s.docs.remove(&params.text_document.uri);
+        drop(s);
+        self.client
+            .publish_diagnostics(params.text_document.uri, vec![], None)
+            .await;
+    }
+
+    // --- DocumentLink（2-3） ---
+
+    async fn document_link(&self, params: DocumentLinkParams) -> Result<Option<Vec<DocumentLink>>> {
+        let s = self.state.read().await;
+        let (Some(index), Some(content), Some(root)) =
+            (&s.index, s.docs.get(&params.text_document.uri), &s.root)
+        else {
+            return Ok(None);
+        };
+
+        let result = parse_links_with_ranges(content)
+            .into_iter()
+            .map(|(reference, range)| {
+                let lsp_range = core_range_to_lsp(range, content);
+                let target = ref_to_uri(&reference, index, root);
+                DocumentLink {
+                    range: lsp_range,
+                    target,
+                    tooltip: None,
+                    data: None,
+                }
+            })
+            .collect();
+
+        Ok(Some(result))
+    }
+
+    // --- GotoDefinition（2-3） ---
+
+    async fn goto_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        let pos = params.text_document_position_params.position;
+        let s = self.state.read().await;
+        let (Some(index), Some(content), Some(root)) = (
+            &s.index,
+            s.docs
+                .get(&params.text_document_position_params.text_document.uri),
+            &s.root,
+        ) else {
+            return Ok(None);
+        };
+
+        let found = parse_links_with_ranges(content)
+            .into_iter()
+            .find(|(_, range)| pos_in_range(pos, core_range_to_lsp(*range, content)));
+
+        let Some((reference, _)) = found else {
+            return Ok(None);
+        };
+
+        Ok(ref_to_location(&reference, index, root).map(GotoDefinitionResponse::Scalar))
+    }
+
+    // --- Hover（2-5） ---
+    //
+    // [[...]] にカーソルを置くと、リンク先の概要を Markdown で表示する。
+    // ドキュメントリンクは見出し一覧、コードシンボルは種別・修飾名・ファイルを出す。
+
+    async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
+        let pos = params.text_document_position_params.position;
+        let s = self.state.read().await;
+        let (Some(index), Some(content)) = (
+            &s.index,
+            s.docs
+                .get(&params.text_document_position_params.text_document.uri),
+        ) else {
+            return Ok(None);
+        };
+
+        let found = parse_links_with_ranges(content)
+            .into_iter()
+            .find(|(_, range)| pos_in_range(pos, core_range_to_lsp(*range, content)));
+
+        let Some((reference, link_range)) = found else {
+            return Ok(None);
+        };
+
+        let text = match index.resolve_reference(&reference) {
+            ReferenceResolution::DocResolved(path) => format_doc_hover(&path, index),
+            ReferenceResolution::CodeResolved { id } => {
+                let Some(entry) = index.symbols.get(id) else {
+                    return Ok(None);
+                };
+                format_code_hover(entry)
+            }
+            _ => return Ok(None),
+        };
+
+        Ok(Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: text,
+            }),
+            // リンク範囲をそのまま返すことで、カーソルを動かしてもすぐ消えない。
+            range: Some(core_range_to_lsp(link_range, content)),
+        }))
+    }
+
+    // --- 補完（2-6） ---
+    //
+    // `[[` を打った瞬間に起動し、ドキュメント名とコードシンボルを候補として返す。
+    // TextEdit で「`[[` の直後〜カーソル」を置換するため、途中まで打っていても
+    // 正しく上書きされる。
+
+    async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
+        let pos = params.text_document_position.position;
+        let s = self.state.read().await;
+        let (Some(index), Some(content)) = (
+            &s.index,
+            s.docs.get(&params.text_document_position.text_document.uri),
+        ) else {
+            return Ok(None);
+        };
+
+        // カーソル行を取得し、`[[` の中にいるか確認する。
+        let line = content.lines().nth(pos.line as usize).unwrap_or("");
+        let cursor_byte = utf16_col_to_byte_offset(line, pos.character);
+        let before_cursor = &line[..cursor_byte.min(line.len())];
+
+        // 最後の `[[` を探し、`]]` で既に閉じられていれば補完しない。
+        let Some(bracket_pos) = before_cursor.rfind("[[") else {
+            return Ok(None);
+        };
+        let after_bracket = &before_cursor[bracket_pos + 2..];
+        if after_bracket.contains("]]") {
+            return Ok(None);
+        }
+
+        // `[[` 直後〜カーソル位置 を TextEdit の置換範囲にする。
+        let bracket_end_utf16 = str_to_utf16_col(&line[..bracket_pos + 2]);
+        let replace_range = Range {
+            start: Position {
+                line: pos.line,
+                character: bracket_end_utf16,
+            },
+            end: pos,
+        };
+
+        let mut items: Vec<CompletionItem> = Vec::new();
+
+        // ドキュメント候補（フルパス）。
+        for doc_path in &index.doc_paths {
+            items.push(CompletionItem {
+                label: doc_path.clone(),
+                kind: Some(CompletionItemKind::FILE),
+                text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                    range: replace_range,
+                    new_text: format!("{doc_path}]]"),
+                })),
+                ..Default::default()
+            });
+        }
+
+        // ドキュメント短縮名（一意なもののみ）。
+        for (stem, path_opt) in &index.doc_by_stem {
+            let Some(full_path) = path_opt else { continue };
+            items.push(CompletionItem {
+                label: stem.clone(),
+                kind: Some(CompletionItemKind::FILE),
+                // detail にフルパスを出すことで候補一覧でファイルパスが見える。
+                detail: Some(full_path.0.clone()),
+                text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                    range: replace_range,
+                    new_text: format!("{stem}]]"),
+                })),
+                ..Default::default()
+            });
+        }
+
+        // コードシンボル候補（`file.rs@Mod::Sym` 形式）。
+        for (_, entry) in index.symbols.iter() {
+            let qualified = entry.descriptor.path.0.join("::");
+            let label = format!("{}@{}", entry.descriptor.file.0, qualified);
+            let kind = entry.descriptor.kind.map(symbol_kind_to_completion_kind);
+            items.push(CompletionItem {
+                label: label.clone(),
+                kind,
+                text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                    range: replace_range,
+                    new_text: format!("{label}]]"),
+                })),
+                ..Default::default()
+            });
+        }
+
+        Ok(if items.is_empty() {
+            None
+        } else {
+            Some(CompletionResponse::Array(items))
+        })
+    }
+
+    // --- CodeLens（2-7） ---
+    //
+    // ソースファイル内の各シンボル定義行に「N 件の参照」を表示する。
+    // グラフの References 辺を集計するだけなので O(辺数)。
+
+    async fn code_lens(&self, params: CodeLensParams) -> Result<Option<Vec<CodeLens>>> {
+        let s = self.state.read().await;
+        let (Some(index), Some(root)) = (&s.index, &s.root) else {
+            return Ok(None);
+        };
+
+        // URI をワークスペース相対パスに変換する。
+        let Some(abs_path) = params.text_document.uri.to_file_path().ok() else {
+            return Ok(None);
+        };
+        let Some(rel) = abs_path.strip_prefix(root).ok() else {
+            return Ok(None);
+        };
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+
+        // References 辺を走査してシンボル ID → 参照数のマップを作る。
+        let mut ref_counts: std::collections::HashMap<dbrain_core::model::SymbolId, usize> =
+            std::collections::HashMap::new();
+        for edge in index.graph.edges() {
+            if let Edge::References {
+                to: NodeId::Symbol(id),
+                ..
+            } = edge
+            {
+                *ref_counts.entry(*id).or_insert(0) += 1;
+            }
+        }
+
+        let lenses: Vec<CodeLens> = index
+            .symbols
+            .iter()
+            .filter(|(_, e)| e.descriptor.file.0 == rel_str)
+            .filter_map(|(id, entry)| {
+                // 参照が 0 件（マップに無い）はレンズを出さない。
+                let count = *ref_counts.get(&id)?;
+                let range = Range {
+                    start: Position {
+                        line: entry.name_range.start.line,
+                        character: entry.name_range.start.character,
+                    },
+                    end: Position {
+                        line: entry.name_range.end.line,
+                        character: entry.name_range.end.character,
+                    },
+                };
+                Some(CodeLens {
+                    range,
+                    command: Some(Command {
+                        title: format!("{count} 件の参照"),
+                        command: String::new(), // 今はクリック動作なし（表示のみ）
+                        arguments: None,
+                    }),
+                    data: None,
+                })
+            })
+            .collect();
+
+        Ok(if lenses.is_empty() {
+            None
+        } else {
+            Some(lenses)
+        })
+    }
 }
 
-// `#[tokio::main]` は「async な main を動かすための非同期ランタイム」を
-// 用意するおまじない。LSP は本質的に「メッセージを待っては応える」処理なので
-// 非同期と相性が良い。
+// ---------------------------------------------------------------------------
+// 診断（2-4）
+// ---------------------------------------------------------------------------
+
+async fn push_diagnostics(uri: &Url, state: &Arc<RwLock<State>>, client: &Client) {
+    let diags = {
+        let s = state.read().await;
+        let (Some(index), Some(content)) = (&s.index, s.docs.get(uri)) else {
+            return;
+        };
+        compute_diagnostics(content, index)
+    };
+    client.publish_diagnostics(uri.clone(), diags, None).await;
+}
+
+fn compute_diagnostics(content: &str, index: &WorkspaceIndex) -> Vec<Diagnostic> {
+    parse_links_with_ranges(content)
+        .into_iter()
+        .filter_map(|(reference, range)| {
+            let lsp_range = core_range_to_lsp(range, content);
+            let (msg, severity) = resolution_to_diagnostic(index.resolve_reference(&reference))?;
+            Some(Diagnostic {
+                range: lsp_range,
+                severity: Some(severity),
+                message: msg,
+                source: Some("developer-brain".to_string()),
+                ..Default::default()
+            })
+        })
+        .collect()
+}
+
+/// 解決結果を診断メッセージに変換する。解決できた場合は `None`（診断不要）。
+fn resolution_to_diagnostic(res: ReferenceResolution) -> Option<(String, DiagnosticSeverity)> {
+    match res {
+        ReferenceResolution::DocResolved(_) | ReferenceResolution::CodeResolved { .. } => None,
+        ReferenceResolution::DocAmbiguous => Some((
+            "同名のドキュメントが複数あります。フルパスで指定してください".to_string(),
+            DiagnosticSeverity::WARNING,
+        )),
+        ReferenceResolution::DocDangling => Some((
+            "リンク先のドキュメントが見つかりません".to_string(),
+            DiagnosticSeverity::WARNING,
+        )),
+        ReferenceResolution::CodeAmbiguous(ids) => Some((
+            format!(
+                "候補が {} 件あります。disambiguator で絞り込んでください",
+                ids.len()
+            ),
+            DiagnosticSeverity::WARNING,
+        )),
+        ReferenceResolution::CodeDangling => Some((
+            "シンボルが見つかりません".to_string(),
+            DiagnosticSeverity::WARNING,
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// リンク解決ヘルパ（LSP アダプタ層）
+// ---------------------------------------------------------------------------
+//
+// `WorkspaceIndex::resolve_reference` がコアで解決結果を返す。
+// ここでは LSP 型（Url, Location）への変換だけを担う「薄い通訳」。
+
+/// 参照を `DocumentLink.target`（URI）に変換する。
+///
+/// コードシンボルは行精度のナビゲーションが必要なため GotoDefinition に委ねる。
+fn ref_to_uri(reference: &Reference, index: &WorkspaceIndex, root: &Path) -> Option<Url> {
+    match index.resolve_reference(reference) {
+        ReferenceResolution::DocResolved(path) => Url::from_file_path(root.join(&path.0)).ok(),
+        ReferenceResolution::CodeResolved { id } => {
+            let entry = index.symbols.get(id)?;
+            Url::from_file_path(root.join(&entry.descriptor.file.0)).ok()
+        }
+        _ => None,
+    }
+}
+
+/// 参照を `Location`（URI + 行・列範囲）に変換する。GotoDefinition で使う。
+fn ref_to_location(reference: &Reference, index: &WorkspaceIndex, root: &Path) -> Option<Location> {
+    match index.resolve_reference(reference) {
+        ReferenceResolution::DocResolved(path) => {
+            let uri = Url::from_file_path(root.join(&path.0)).ok()?;
+            Some(Location {
+                uri,
+                range: Range::default(),
+            })
+        }
+        ReferenceResolution::CodeResolved { id } => {
+            let entry = index.symbols.get(id)?;
+            let uri = Url::from_file_path(root.join(&entry.descriptor.file.0)).ok()?;
+            // name_range を使うことで定義全体ではなく名前部分にカーソルが移動する。
+            // character は code.rs で byte_col_to_char_count により char 数に変換済み。
+            let range = Range {
+                start: Position {
+                    line: entry.name_range.start.line,
+                    character: entry.name_range.start.character,
+                },
+                end: Position {
+                    line: entry.name_range.end.line,
+                    character: entry.name_range.end.character,
+                },
+            };
+            Some(Location { uri, range })
+        }
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Hover コンテンツ生成（2-5）
+// ---------------------------------------------------------------------------
+
+/// ドキュメントリンクの Hover テキストを生成する。
+///
+/// グラフの Section ノードを走査して見出し一覧を得る。
+/// 見出しがなければパスだけを表示する。
+fn format_doc_hover(path: &RelPath, index: &WorkspaceIndex) -> String {
+    let headings: Vec<&str> = index
+        .graph
+        .node_ids()
+        .filter_map(|n| match n {
+            NodeId::Section(p, h) if p == path => Some(h.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    if headings.is_empty() {
+        format!("**{}**", path.0)
+    } else {
+        let list = headings
+            .iter()
+            .map(|h| format!("- {h}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("**{}**\n\n{}", path.0, list)
+    }
+}
+
+/// コードシンボルの Hover テキストを生成する。
+///
+/// 種別（fn / struct 等）・修飾名・ファイルパスを Markdown で組み立てる。
+fn format_code_hover(entry: &SymbolEntry) -> String {
+    let kind = entry
+        .descriptor
+        .kind
+        .map(symbol_kind_str)
+        .unwrap_or("symbol");
+    let qualified = entry.descriptor.path.0.join("::");
+    format!(
+        "**{}** `{}`\n\n`{}`",
+        kind, qualified, entry.descriptor.file.0
+    )
+}
+
+/// [`SymbolKind`] を人が読みやすい短い文字列に変換する。
+fn symbol_kind_str(kind: SymbolKind) -> &'static str {
+    match kind {
+        SymbolKind::Function => "fn",
+        SymbolKind::Method => "fn",
+        SymbolKind::Struct => "struct",
+        SymbolKind::Enum => "enum",
+        SymbolKind::Trait => "trait",
+        SymbolKind::Type => "type",
+        SymbolKind::Const => "const",
+        SymbolKind::Static => "static",
+        SymbolKind::Field => "field",
+        SymbolKind::Variant => "variant",
+        SymbolKind::Variable => "var",
+        SymbolKind::Macro => "macro!",
+        SymbolKind::Module => "mod",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 補完ヘルパ（2-6）
+// ---------------------------------------------------------------------------
+
+/// LSP の UTF-16 列番号を行テキスト内のバイトオフセットに変換する。
+///
+/// 補完の `position` は UTF-16 単位で届くが、Rust の文字列操作はバイト単位なので変換が要る。
+fn utf16_col_to_byte_offset(line: &str, utf16_col: u32) -> usize {
+    let mut col = 0u32;
+    let mut byte_offset = 0;
+    for ch in line.chars() {
+        if col >= utf16_col {
+            break;
+        }
+        col += ch.len_utf16() as u32;
+        byte_offset += ch.len_utf8();
+    }
+    byte_offset
+}
+
+/// 文字列の先頭から末尾までの UTF-16 code unit 数を返す。
+///
+/// TextEdit の範囲計算で「`[[` の直後の UTF-16 列番号」を求めるために使う。
+fn str_to_utf16_col(s: &str) -> u32 {
+    s.chars().map(|c| c.len_utf16() as u32).sum()
+}
+
+/// [`SymbolKind`] を LSP の [`CompletionItemKind`] に対応付ける。
+fn symbol_kind_to_completion_kind(kind: SymbolKind) -> CompletionItemKind {
+    match kind {
+        SymbolKind::Function | SymbolKind::Method => CompletionItemKind::FUNCTION,
+        SymbolKind::Struct | SymbolKind::Enum | SymbolKind::Trait | SymbolKind::Type => {
+            CompletionItemKind::CLASS
+        }
+        SymbolKind::Const | SymbolKind::Static => CompletionItemKind::CONSTANT,
+        SymbolKind::Field => CompletionItemKind::FIELD,
+        SymbolKind::Variant => CompletionItemKind::ENUM_MEMBER,
+        SymbolKind::Variable => CompletionItemKind::VARIABLE,
+        SymbolKind::Macro => CompletionItemKind::KEYWORD,
+        SymbolKind::Module => CompletionItemKind::MODULE,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 型エイリアス（型推論補助）
+// ---------------------------------------------------------------------------
+
+/// `parse_links_with_ranges` の要素型。handlers から参照を渡すときに使う。
+type Reference = dbrain_core::model::Reference;
+
+// ---------------------------------------------------------------------------
+// UTF-16 位置変換（LSP アダプタ層の責務）
+// ---------------------------------------------------------------------------
+
+fn core_range_to_lsp(range: dbrain_core::model::Range, content: &str) -> Range {
+    Range {
+        start: core_pos_to_lsp(range.start, content),
+        end: core_pos_to_lsp(range.end, content),
+    }
+}
+
+/// コアの `model::Position`（UTF-8 char 数）を LSP の `Position`（UTF-16 code unit）に変換する。
+///
+/// `parse_links_with_ranges` が返す位置は UTF-8 char 数。LSP の規約は UTF-16 code unit 数。
+/// BMP 外文字（絵文字等）は UTF-16 で 2 unit になるため、`char.len_utf16()` で積算する。
+fn core_pos_to_lsp(pos: dbrain_core::model::Position, content: &str) -> Position {
+    let line_str = content.lines().nth(pos.line as usize).unwrap_or("");
+    let utf16_char: u32 = line_str
+        .chars()
+        .take(pos.character as usize)
+        .map(|c| c.len_utf16() as u32)
+        .sum();
+    Position {
+        line: pos.line,
+        character: utf16_char,
+    }
+}
+
+fn pos_in_range(pos: Position, range: Range) -> bool {
+    if pos.line != range.start.line {
+        return false;
+    }
+    pos.character >= range.start.character && pos.character < range.end.character
+}
+
+// ---------------------------------------------------------------------------
+// エントリポイント
+// ---------------------------------------------------------------------------
+
 #[tokio::main]
 async fn main() {
-    // エディタとは標準入出力でやり取りする。
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
-    // LspService がプロトコル処理を担い、Backend が実際の応答を書く。
-    let (service, socket) = LspService::new(|client| Backend { client });
+    let (service, socket) = LspService::new(|client| Backend {
+        client,
+        state: Arc::new(RwLock::new(State::new())),
+    });
 
-    // サーバを起動し、エディタが切断するまでメッセージを捌き続ける。
     Server::new(stdin, stdout, socket).serve(service).await;
 }
