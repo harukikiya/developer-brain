@@ -30,7 +30,9 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use dbrain_core::index::{
     index_workspace, parse_links_with_ranges, ReferenceResolution, WorkspaceIndex,
@@ -71,11 +73,50 @@ impl State {
 struct Backend {
     client: Client,
     state: Arc<RwLock<State>>,
+    /// 再索引の「変更世代」カウンタ（デバウンス用）。
+    ///
+    /// 変更トリガーのたびに +1 する。スケジュールされた再索引タスクは
+    /// 起床時にこの値が自分の捕捉した世代と一致するかを確認し、
+    /// 一致しなければ（より新しいトリガーが来ていれば）自分を破棄する。
+    /// これで「連続トリガーの最後の 1 回だけ実行」を実現する（[`Backend::schedule_reindex`]）。
+    reindex_generation: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for Backend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Backend").finish_non_exhaustive()
+    }
+}
+
+/// 再索引デバウンスの待機時間。連続した変更トリガーをこの時間まとめる。
+const REINDEX_DEBOUNCE: Duration = Duration::from_millis(300);
+
+impl Backend {
+    /// 再索引を「デバウンス付き」でスケジュールする（M4 4-3）。
+    ///
+    /// 連続した保存やファイル変更で再索引が何度も走るのを防ぐ。仕組み:
+    /// 1. 世代カウンタを +1 し、その新しい値（`my_gen`）を覚える。
+    /// 2. [`REINDEX_DEBOUNCE`] だけ待つ。
+    /// 3. 起床時にカウンタがまだ `my_gen` のままなら（後続トリガーが無ければ）
+    ///    実際に再索引する。進んでいれば自分は破棄する。
+    ///
+    /// これで「連続トリガーの最後の 1 回だけが実行される」。待ち行列も
+    /// チャンネルも要らず、`AtomicU64` 1 個で完結する。
+    fn schedule_reindex(&self) {
+        // fetch_add は加算前の値を返すので、+1 した新しい値が my_gen。
+        let my_gen = self.reindex_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let generation = Arc::clone(&self.reindex_generation);
+        let state = Arc::clone(&self.state);
+        let client = self.client.clone();
+
+        tokio::spawn(async move {
+            tokio::time::sleep(REINDEX_DEBOUNCE).await;
+            // 自分が最後のトリガーだった場合のみ実行する。
+            // 後続トリガーが来ていれば generation は my_gen より大きい。
+            if generation.load(Ordering::SeqCst) == my_gen {
+                reindex(state, client).await;
+            }
+        });
     }
 }
 
@@ -101,8 +142,16 @@ impl LanguageServer for Backend {
                 version: Some(env!("CARGO_PKG_VERSION").to_string()),
             }),
             capabilities: ServerCapabilities {
-                text_document_sync: Some(TextDocumentSyncCapability::Kind(
-                    TextDocumentSyncKind::FULL,
+                // 単なる同期種別(Kind)ではなく Options を使うのは、保存通知(did_save)を
+                // 受け取りたいから。Kind だけだと save 通知は届かない。
+                // include_text=false: 保存時にファイル全文は不要（ディスクから読み直すため）。
+                text_document_sync: Some(TextDocumentSyncCapability::Options(
+                    TextDocumentSyncOptions {
+                        open_close: Some(true),
+                        change: Some(TextDocumentSyncKind::FULL),
+                        save: Some(TextDocumentSyncSaveOptions::Supported(true)),
+                        ..Default::default()
+                    },
                 )),
                 document_link_provider: Some(DocumentLinkOptions {
                     resolve_provider: Some(false),
@@ -141,51 +190,8 @@ impl LanguageServer for Backend {
             .log_message(MessageType::INFO, "developer-brain-lsp initialized")
             .await;
 
-        let root = {
-            let s = self.state.read().await;
-            s.root.clone()
-        };
-
-        if let Some(root) = root {
-            let state_arc = Arc::clone(&self.state);
-            let client = self.client.clone();
-
-            tokio::spawn(async move {
-                client
-                    .log_message(MessageType::INFO, "developer-brain: indexing workspace...")
-                    .await;
-
-                let result = tokio::task::spawn_blocking(move || index_workspace(&root)).await;
-
-                match result {
-                    Ok(index) => {
-                        let msg = format!(
-                            "developer-brain: indexed {} nodes, {} edges",
-                            index.graph.node_count(),
-                            index.graph.edge_count(),
-                        );
-                        let open_uris: Vec<Url> = {
-                            let mut s = state_arc.write().await;
-                            let uris = s.docs.keys().cloned().collect();
-                            s.index = Some(index);
-                            uris
-                        };
-                        client.log_message(MessageType::INFO, msg).await;
-                        for uri in open_uris {
-                            push_diagnostics(&uri, &state_arc, &client).await;
-                        }
-                    }
-                    Err(e) => {
-                        client
-                            .log_message(
-                                MessageType::ERROR,
-                                format!("developer-brain: indexing failed: {e}"),
-                            )
-                            .await;
-                    }
-                }
-            });
-        }
+        // 起動直後にバックグラウンドで初回索引を構築する。
+        tokio::spawn(reindex(Arc::clone(&self.state), self.client.clone()));
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -219,6 +225,25 @@ impl LanguageServer for Backend {
         self.client
             .publish_diagnostics(params.text_document.uri, vec![], None)
             .await;
+    }
+
+    // --- 増分更新（M4 4-1）: 保存時に再索引する ---
+    //
+    // タイプ中（did_change）はバッファ更新＋当該ドキュメントの診断のみで、索引は
+    // 更新しない。保存時はディスクが最新になるので、ここで索引を作り直し、
+    // シンボルの増減やリンク解決の変化を全ドキュメントの診断に反映する。
+    async fn did_save(&self, _params: DidSaveTextDocumentParams) {
+        self.schedule_reindex();
+    }
+
+    // --- 増分更新（M4 4-2）: エディタ外のファイル変更に追従する ---
+    //
+    // git checkout、外部エディタでの編集、ファイルの新規作成/削除など、
+    // VS Code のドキュメント編集を経由しない変更はここに届く。
+    // クライアント（拡張）側の FileSystemWatcher が監視対象を購読しているため、
+    // 該当ファイルが変わるとこの通知が来る。保存時と同じく索引を作り直す。
+    async fn did_change_watched_files(&self, _params: DidChangeWatchedFilesParams) {
+        self.schedule_reindex();
     }
 
     // --- DocumentLink（2-3） ---
@@ -546,6 +571,81 @@ impl LanguageServer for Backend {
 }
 
 // ---------------------------------------------------------------------------
+// 再索引（M4 4-1 / 4-4）
+// ---------------------------------------------------------------------------
+
+/// 再索引完了をクライアントへ知らせるカスタム通知（M4 4-4）。
+///
+/// LSP 標準にない独自メソッド。診断の push と同じく「応答を期待しない一方向
+/// メッセージ」で、サーバ→クライアントへ送る。拡張側はこれを購読し、
+/// グラフビューが開いていれば最新のグラフを取り直す。パラメータは持たない。
+enum GraphChangedNotification {}
+
+impl tower_lsp::lsp_types::notification::Notification for GraphChangedNotification {
+    type Params = ();
+    const METHOD: &'static str = "dbrain/graphChanged";
+}
+
+/// ワークスペースを索引し直し、結果を state に格納して全ドキュメントの診断を更新する。
+///
+/// 起動時（initialized）と保存時（did_save）の両方から呼ばれる共通処理。
+/// `index_workspace` は CPU バウンドな同期処理なので `spawn_blocking` で
+/// 非同期エグゼキュータをブロックしないようにする。
+///
+/// 所有権を引数で受け取る（参照ではない）のは、`tokio::spawn` に渡して
+/// バックグラウンド実行するため。`Arc` と `Client` はどちらも安価に clone できる。
+async fn reindex(state: Arc<RwLock<State>>, client: Client) {
+    let root = {
+        let s = state.read().await;
+        s.root.clone()
+    };
+    let Some(root) = root else {
+        return;
+    };
+
+    client
+        .log_message(MessageType::INFO, "developer-brain: indexing workspace...")
+        .await;
+
+    let result = tokio::task::spawn_blocking(move || index_workspace(&root)).await;
+
+    match result {
+        Ok(index) => {
+            let msg = format!(
+                "developer-brain: indexed {} nodes, {} edges",
+                index.graph.node_count(),
+                index.graph.edge_count(),
+            );
+            // 索引を差し替えてから、開いている全ドキュメントの診断を更新する。
+            // シンボルの増減やリンク解決の変化が、編集していないファイルの
+            // 波線にも反映される（これが M4 の主目的）。
+            let open_uris: Vec<Url> = {
+                let mut s = state.write().await;
+                let uris = s.docs.keys().cloned().collect();
+                s.index = Some(index);
+                uris
+            };
+            client.log_message(MessageType::INFO, msg).await;
+            for uri in open_uris {
+                push_diagnostics(&uri, &state, &client).await;
+            }
+            // グラフが変わった可能性があるので、開いている Webview に再取得を促す。
+            client
+                .send_notification::<GraphChangedNotification>(())
+                .await;
+        }
+        Err(e) => {
+            client
+                .log_message(
+                    MessageType::ERROR,
+                    format!("developer-brain: indexing failed: {e}"),
+                )
+                .await;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 診断（2-4）
 // ---------------------------------------------------------------------------
 
@@ -817,6 +917,7 @@ async fn main() {
     let (service, socket) = LspService::new(|client| Backend {
         client,
         state: Arc::new(RwLock::new(State::new())),
+        reindex_generation: Arc::new(AtomicU64::new(0)),
     });
 
     Server::new(stdin, stdout, socket).serve(service).await;
