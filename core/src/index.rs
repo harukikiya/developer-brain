@@ -632,8 +632,9 @@ pub fn index_workspace(root: &Path) -> WorkspaceIndex {
     }
 
     // --- pass 1: 全 .md を読み、Doc/Section ノードと Contains 辺を作る ---
+    // content を保持するのは pass 3 で find_term_mentions に再利用するため。
     // 同時に glossary/ 配下のノートを用語集エントリとして収集する（D8）。
-    let mut docs: Vec<(RelPath, ParsedDoc)> = Vec::new();
+    let mut docs: Vec<(RelPath, ParsedDoc, String)> = Vec::new();
     let mut glossary_terms: Vec<GlossaryTerm> = Vec::new();
     for path in walk_by_ext(root, "md") {
         let rel = to_rel(root, &path);
@@ -647,7 +648,7 @@ pub fn index_workspace(root: &Path) -> WorkspaceIndex {
                 });
             }
         }
-        docs.push((rel, index_document(&content)));
+        docs.push((rel, index_document(&content), content));
     }
     let glossary = Glossary::new(glossary_terms);
 
@@ -655,7 +656,7 @@ pub fn index_workspace(root: &Path) -> WorkspaceIndex {
     // 短縮名（ファイル名ステム）→ パス。一意なものだけ解決に使う。
     let mut stem_to_path: HashMap<String, Option<RelPath>> = HashMap::new();
 
-    for (rel, parsed) in &docs {
+    for (rel, parsed, _content) in &docs {
         doc_paths.insert(rel.0.clone());
         if let Some(stem) = file_stem(&rel.0) {
             stem_to_path
@@ -677,7 +678,7 @@ pub fn index_workspace(root: &Path) -> WorkspaceIndex {
     }
 
     // --- pass 2: 参照を解決して辺を張る ---
-    for (rel, parsed) in &docs {
+    for (rel, parsed, _content) in &docs {
         let from = NodeId::Doc(rel.clone());
         for r in &parsed.refs {
             match r {
@@ -703,6 +704,26 @@ pub fn index_workspace(root: &Path) -> WorkspaceIndex {
                         graph.code_refs_unresolved += 1;
                     }
                 },
+            }
+        }
+    }
+
+    // --- pass 3: 用語の出現をグラフに反映（Term ノード + Mentions 辺）---
+    // 出現があった用語だけ Term ノードにする（省メモリ）。
+    // 同一ドキュメントに同じ用語が複数回出現しても辺は 1 本に集約する。
+    for (rel, _parsed, content) in &docs {
+        let mentions = find_term_mentions(content, &glossary, rel);
+        // 同一ドキュメント内で既に辺を張った term_index を記録する。
+        let mut seen_in_doc: HashSet<usize> = HashSet::new();
+        for m in mentions {
+            if seen_in_doc.insert(m.term_index) {
+                let term = &glossary.terms()[m.term_index];
+                // 初めて出現した用語は Term ノードも追加（add_node は重複を排除する）。
+                graph.add_node(NodeId::Term(term.name.clone()), term.name.clone());
+                graph.add_edge(Edge::Mentions {
+                    from: NodeId::Doc(rel.clone()),
+                    term: term.name.clone(),
+                });
             }
         }
     }
@@ -1370,6 +1391,94 @@ mod tests {
         // doc.md 側で用語出現が検出できる。
         let ms = find_term_mentions("LIN を採用する。", &idx.glossary, &RelPath("doc.md".into()));
         assert_eq!(ms.len(), 1);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 観点: 用語が出現した doc には Term ノードと Mentions 辺が 1 本追加される。
+    /// 同じ用語が複数回出現しても辺は doc×term で 1 本に集約される。
+    #[test]
+    fn workspace_adds_term_nodes_and_mentions_edges() {
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("dbrain_ws_term_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("glossary")).unwrap();
+        fs::write(dir.join("glossary/LIN.md"), "LIN は通信規格。\n").unwrap();
+        // doc.md に "LIN" が 2 回出現する。辺は 1 本になるはず。
+        fs::write(dir.join("doc.md"), "LIN バスは LIN プロトコルを使う。\n").unwrap();
+
+        let idx = index_workspace(&dir);
+
+        // Term ノードが存在する。
+        let has_term = idx
+            .graph
+            .node_ids()
+            .any(|n| matches!(n, NodeId::Term(t) if t == "LIN"));
+        assert!(has_term, "Term ノードが追加されていること");
+
+        // Mentions 辺がちょうど 1 本。
+        let mentions_count = idx
+            .graph
+            .edges()
+            .iter()
+            .filter(|e| matches!(e, Edge::Mentions { term, .. } if term == "LIN"))
+            .count();
+        assert_eq!(
+            mentions_count, 1,
+            "同一 doc×term の辺は 1 本に集約されること"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 観点: 用語が一度も出現しない場合は Term ノードを作らない（省メモリ）。
+    #[test]
+    fn workspace_no_term_node_when_no_mention() {
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("dbrain_ws_noterm_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("glossary")).unwrap();
+        fs::write(dir.join("glossary/LIN.md"), "LIN は通信規格。\n").unwrap();
+        // doc.md に "LIN" は出現しない。
+        fs::write(dir.join("doc.md"), "CAN バスを使う。\n").unwrap();
+
+        let idx = index_workspace(&dir);
+
+        let has_term = idx.graph.node_ids().any(|n| matches!(n, NodeId::Term(_)));
+        assert!(!has_term, "出現がない用語は Term ノードを作らないこと");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 観点: 複数の doc から同じ用語が出現したとき、Term ノードは 1 個・辺は doc 数分。
+    #[test]
+    fn workspace_term_node_deduplicated_across_docs() {
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("dbrain_ws_multiterm_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("glossary")).unwrap();
+        fs::write(dir.join("glossary/LIN.md"), "LIN は通信規格。\n").unwrap();
+        fs::write(dir.join("a.md"), "LIN を参照。\n").unwrap();
+        fs::write(dir.join("b.md"), "LIN を採用した。\n").unwrap();
+
+        let idx = index_workspace(&dir);
+
+        // Term ノードは重複しない（add_node が排除する）。
+        let term_count = idx
+            .graph
+            .node_ids()
+            .filter(|n| matches!(n, NodeId::Term(_)))
+            .count();
+        assert_eq!(term_count, 1, "Term ノードは 1 個だけ");
+
+        // Mentions 辺は a.md と b.md で 2 本。
+        let mentions_count = idx
+            .graph
+            .edges()
+            .iter()
+            .filter(|e| matches!(e, Edge::Mentions { .. }))
+            .count();
+        assert_eq!(mentions_count, 2, "doc 数分の Mentions 辺があること");
 
         let _ = fs::remove_dir_all(&dir);
     }
