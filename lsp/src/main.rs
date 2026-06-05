@@ -17,7 +17,7 @@
 //! 「LSP のリクエストを受け取り、コアに渡し、結果を LSP の形に直して返す」
 //! という通訳に徹します。賢さはコアに、礼儀作法（プロトコル）はここに。
 //!
-//! ## M2 の実装内容
+//! ## 実装内容
 //!
 //! | サブタスク | 機能 |
 //! |-----------|------|
@@ -27,6 +27,7 @@
 //! | 2-5 | Hover |
 //! | 2-6 | `[[` 補完 |
 //! | 2-7 | CodeLens（逆参照数）|
+//! | 5-3 | 用語集の仮想リンク（DocumentLink + Hover）|
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -35,7 +36,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use dbrain_core::index::{
-    index_workspace, parse_links_with_ranges, ReferenceResolution, WorkspaceIndex,
+    find_term_mentions, index_workspace, parse_links_with_ranges, ReferenceResolution,
+    WorkspaceIndex,
 };
 use dbrain_core::model::{Edge, NodeId, RelPath, SymbolEntry, SymbolKind};
 use tokio::sync::RwLock;
@@ -246,7 +248,10 @@ impl LanguageServer for Backend {
         self.schedule_reindex();
     }
 
-    // --- DocumentLink（2-3） ---
+    // --- DocumentLink（2-3 / 5-3） ---
+    //
+    // [[...]] の明示リンクと、用語集の仮想リンク（D8）の両方を返す。
+    // 仮想リンクは本文を書き換えず、エディタ上だけでリンクとして振る舞う。
 
     async fn document_link(&self, params: DocumentLinkParams) -> Result<Option<Vec<DocumentLink>>> {
         let s = self.state.read().await;
@@ -256,7 +261,8 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
 
-        let result = parse_links_with_ranges(content)
+        // [[...]] の明示リンク。
+        let mut result: Vec<DocumentLink> = parse_links_with_ranges(content)
             .into_iter()
             .map(|(reference, range)| {
                 let lsp_range = core_range_to_lsp(range, content);
@@ -269,6 +275,24 @@ impl LanguageServer for Backend {
                 }
             })
             .collect();
+
+        // 用語集の仮想リンク（5-3）: 本文中の用語出現を DocumentLink に変換する。
+        // find_term_mentions は既存 [[...]] 内を除外するので二重リンクにならない。
+        if let Some(rel) = uri_to_rel_path(&params.text_document.uri, root) {
+            for m in find_term_mentions(content, &index.glossary, &rel) {
+                let Some(term) = index.glossary.get(m.term_index) else {
+                    continue;
+                };
+                let target = Url::from_file_path(root.join(&term.path.0)).ok();
+                result.push(DocumentLink {
+                    range: core_range_to_lsp(m.range, content),
+                    target,
+                    // tooltip はリンクにカーソルを合わせたときに出る短い説明。
+                    tooltip: Some(term.name.clone()),
+                    data: None,
+                });
+            }
+        }
 
         Ok(Some(result))
     }
@@ -301,48 +325,67 @@ impl LanguageServer for Backend {
         Ok(ref_to_location(&reference, index, root).map(GotoDefinitionResponse::Scalar))
     }
 
-    // --- Hover（2-5） ---
+    // --- Hover（2-5 / 5-3） ---
     //
+    // 優先順位: [[...]] リンク → 用語集の仮想リンク。
     // [[...]] にカーソルを置くと、リンク先の概要を Markdown で表示する。
-    // ドキュメントリンクは見出し一覧、コードシンボルは種別・修飾名・ファイルを出す。
+    // 用語集の仮想リンクでは用語名と定義抜粋を表示する。
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
         let pos = params.text_document_position_params.position;
+        let uri = &params.text_document_position_params.text_document.uri;
         let s = self.state.read().await;
-        let (Some(index), Some(content)) = (
-            &s.index,
-            s.docs
-                .get(&params.text_document_position_params.text_document.uri),
-        ) else {
+        let (Some(index), Some(content), Some(root)) = (&s.index, s.docs.get(uri), &s.root) else {
             return Ok(None);
         };
 
+        // --- 1. [[...]] リンクの Hover ---
         let found = parse_links_with_ranges(content)
             .into_iter()
             .find(|(_, range)| pos_in_range(pos, core_range_to_lsp(*range, content)));
 
-        let Some((reference, link_range)) = found else {
+        if let Some((reference, link_range)) = found {
+            let text = match index.resolve_reference(&reference) {
+                ReferenceResolution::DocResolved(path) => format_doc_hover(&path, index),
+                ReferenceResolution::CodeResolved { id } => {
+                    let Some(entry) = index.symbols.get(id) else {
+                        return Ok(None);
+                    };
+                    format_code_hover(entry)
+                }
+                _ => return Ok(None),
+            };
+            return Ok(Some(Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: text,
+                }),
+                // リンク範囲をそのまま返すことで、カーソルを動かしてもすぐ消えない。
+                range: Some(core_range_to_lsp(link_range, content)),
+            }));
+        }
+
+        // --- 2. 用語集の仮想リンク Hover（5-3）---
+        let Some(rel) = uri_to_rel_path(uri, root) else {
             return Ok(None);
         };
+        let mention = find_term_mentions(content, &index.glossary, &rel)
+            .into_iter()
+            .find(|m| pos_in_range(pos, core_range_to_lsp(m.range, content)));
 
-        let text = match index.resolve_reference(&reference) {
-            ReferenceResolution::DocResolved(path) => format_doc_hover(&path, index),
-            ReferenceResolution::CodeResolved { id } => {
-                let Some(entry) = index.symbols.get(id) else {
-                    return Ok(None);
-                };
-                format_code_hover(entry)
-            }
-            _ => return Ok(None),
+        let Some(m) = mention else {
+            return Ok(None);
+        };
+        let Some(term) = index.glossary.get(m.term_index) else {
+            return Ok(None);
         };
 
         Ok(Some(Hover {
             contents: HoverContents::Markup(MarkupContent {
                 kind: MarkupKind::Markdown,
-                value: text,
+                value: format!("**{}**\n\n{}", term.name, term.definition),
             }),
-            // リンク範囲をそのまま返すことで、カーソルを動かしてもすぐ消えない。
-            range: Some(core_range_to_lsp(link_range, content)),
+            range: Some(core_range_to_lsp(m.range, content)),
         }))
     }
 
@@ -709,6 +752,17 @@ fn resolution_to_diagnostic(res: ReferenceResolution) -> Option<(String, Diagnos
 //
 // `WorkspaceIndex::resolve_reference` がコアで解決結果を返す。
 // ここでは LSP 型（Url, Location）への変換だけを担う「薄い通訳」。
+
+/// ドキュメント URI をワークスペース相対パス（[`RelPath`]）に変換する。
+///
+/// `find_term_mentions` はファイルを特定するために `current_path` を受け取るが、
+/// LSP ハンドラが持つのは URI。この関数で橋渡しする。
+/// URI がファイルパスでない場合や、root の外にある場合は `None`。
+fn uri_to_rel_path(uri: &Url, root: &Path) -> Option<RelPath> {
+    let abs = uri.to_file_path().ok()?;
+    let rel = abs.strip_prefix(root).ok()?;
+    Some(RelPath(rel.to_string_lossy().replace('\\', "/")))
+}
 
 /// 参照を `DocumentLink.target`（URI）に変換する。
 ///
