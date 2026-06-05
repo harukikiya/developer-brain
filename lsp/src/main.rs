@@ -695,10 +695,13 @@ async fn reindex(state: Arc<RwLock<State>>, client: Client) {
 async fn push_diagnostics(uri: &Url, state: &Arc<RwLock<State>>, client: &Client) {
     let diags = {
         let s = state.read().await;
-        let (Some(index), Some(content)) = (&s.index, s.docs.get(uri)) else {
+        let (Some(index), Some(content), Some(root)) = (&s.index, s.docs.get(uri), &s.root) else {
             return;
         };
-        compute_diagnostics(content, index)
+        let mut diags = compute_diagnostics(content, index);
+        // 用語集ノートへの重複定義警告（5-4）。
+        diags.extend(compute_glossary_diagnostics(uri, content, index, root));
+        diags
     };
     client.publish_diagnostics(uri.clone(), diags, None).await;
 }
@@ -718,6 +721,55 @@ fn compute_diagnostics(content: &str, index: &WorkspaceIndex) -> Vec<Diagnostic>
             })
         })
         .collect()
+}
+
+/// 用語集ノートの重複定義を診断する（M5-4 Linter）。
+///
+/// 現在のファイルが `glossary/` 配下のノートであり、かつ同一用語名のノートが
+/// 他にも存在する（[`WorkspaceIndex::duplicate_terms`] に登録されている）場合に
+/// Warning 診断を返す。範囲は最初の行（見出し行）全体。
+///
+/// この診断は「定義が正しい場所」、つまり用語ノート自身に出す設計にしている。
+/// どちらが正しい定義かはツールには判断できないので、両方のファイルに警告を出す。
+fn compute_glossary_diagnostics(
+    uri: &Url,
+    content: &str,
+    index: &WorkspaceIndex,
+    root: &Path,
+) -> Vec<Diagnostic> {
+    let Some(rel) = uri_to_rel_path(uri, root) else {
+        return Vec::new();
+    };
+    // glossary/ 配下のノートだけが対象。
+    if rel.0.split('/').next() != Some("glossary") {
+        return Vec::new();
+    }
+    let stem = std::path::Path::new(&rel.0)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if stem.is_empty() || !index.duplicate_terms.contains(&stem) {
+        return Vec::new();
+    }
+    // 見出し行（最初の行）をハイライト範囲にする。
+    let first_line = content.lines().next().unwrap_or("");
+    let end_char: u32 = first_line.chars().map(|c| c.len_utf16() as u32).sum();
+    vec![Diagnostic {
+        range: Range {
+            start: Position {
+                line: 0,
+                character: 0,
+            },
+            end: Position {
+                line: 0,
+                character: end_char,
+            },
+        },
+        severity: Some(DiagnosticSeverity::WARNING),
+        message: format!("用語「{stem}」が複数のファイルで定義されています"),
+        source: Some("developer-brain".to_string()),
+        ..Default::default()
+    }]
 }
 
 /// 解決結果を診断メッセージに変換する。解決できた場合は `None`（診断不要）。

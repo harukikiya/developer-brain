@@ -273,6 +273,12 @@ pub struct WorkspaceIndex {
     /// `glossary/` 配下のノートから構築した用語集（D8 の仮想リンク用）。
     /// 用語の出現位置は保存せず、[`find_term_mentions`] で要求時に算出する。
     pub glossary: Glossary,
+    /// 重複定義されている用語名の集合（M5-4 Linter 診断用）。
+    ///
+    /// `glossary/` 配下で同一ファイル名ステムを持つノートが 2 つ以上ある場合に登録される。
+    /// 例: `glossary/LIN.md` と `glossary/sub/LIN.md` が共存すると `"LIN"` が入る。
+    /// LSP アダプタはこれを使い、該当する用語ノートに Warning 診断を出す。
+    pub duplicate_terms: HashSet<String>,
 }
 
 /// [`WorkspaceIndex::resolve_reference`] が返す解決結果。
@@ -650,6 +656,19 @@ pub fn index_workspace(root: &Path) -> WorkspaceIndex {
         }
         docs.push((rel, index_document(&content), content));
     }
+
+    // 重複定義の検出: 同一用語名（ファイル名ステム）が 2 つ以上ある用語を集める。
+    // Glossary::new に渡す前に集計することで、所有権の移動と分離できる。
+    let mut stem_count: HashMap<String, usize> = HashMap::new();
+    for t in &glossary_terms {
+        *stem_count.entry(t.name.clone()).or_insert(0) += 1;
+    }
+    let duplicate_terms: HashSet<String> = stem_count
+        .into_iter()
+        .filter(|(_, count)| *count > 1)
+        .map(|(name, _)| name)
+        .collect();
+
     let glossary = Glossary::new(glossary_terms);
 
     let mut doc_paths: HashSet<String> = HashSet::new();
@@ -734,6 +753,7 @@ pub fn index_workspace(root: &Path) -> WorkspaceIndex {
         doc_paths,
         doc_by_stem: stem_to_path,
         glossary,
+        duplicate_terms,
     }
 }
 
@@ -1481,5 +1501,47 @@ mod tests {
         assert_eq!(mentions_count, 2, "doc 数分の Mentions 辺があること");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 観点: glossary/ 配下に同一ステムが複数ある場合、duplicate_terms に登録される。
+    /// 重複がない場合は空集合のままであること。
+    #[test]
+    fn workspace_detects_duplicate_glossary_terms() {
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("dbrain_ws_dup_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("glossary/sub")).unwrap();
+        // 同じステム "LIN" を 2 ファイルで作る（別サブディレクトリでも重複と見なす）。
+        fs::write(dir.join("glossary/LIN.md"), "LIN は通信規格。\n").unwrap();
+        fs::write(dir.join("glossary/sub/LIN.md"), "LIN の別定義。\n").unwrap();
+        // "CAN" は 1 ファイルなので重複しない。
+        fs::write(dir.join("glossary/CAN.md"), "CAN は別の規格。\n").unwrap();
+
+        let idx = index_workspace(&dir);
+        assert!(
+            idx.duplicate_terms.contains("LIN"),
+            "重複ステム LIN が duplicate_terms に登録されること"
+        );
+        assert!(
+            !idx.duplicate_terms.contains("CAN"),
+            "重複なし CAN は duplicate_terms に登録されないこと"
+        );
+    }
+
+    /// 観点: 重複がない場合は duplicate_terms が空集合。
+    #[test]
+    fn workspace_no_duplicates_when_unique() {
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("dbrain_ws_nodup_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("glossary")).unwrap();
+        fs::write(dir.join("glossary/LIN.md"), "LIN は通信規格。\n").unwrap();
+        fs::write(dir.join("glossary/CAN.md"), "CAN は別の規格。\n").unwrap();
+
+        let idx = index_workspace(&dir);
+        assert!(
+            idx.duplicate_terms.is_empty(),
+            "重複がなければ duplicate_terms は空"
+        );
     }
 }
