@@ -51,7 +51,7 @@ jobs:
             > target/doc/index.html
 
       - name: Pages 用に成果物をアップロード
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v5
         with:
           path: target/doc
 
