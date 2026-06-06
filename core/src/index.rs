@@ -212,6 +212,15 @@ impl KnowledgeGraph {
         self.nodes.iter().map(|n| &n.id)
     }
 
+    /// 指定した doc パスに、指定した見出しを持つ Section ノードが存在するかを調べる。
+    ///
+    /// `[[doc.md#heading]]` の見出し照合に使う。`seen` は `HashSet<NodeId>` なので
+    /// O(1) で判定できる。見出しは厳密一致（大文字・スペースの正規化なし）。
+    pub fn has_section(&self, path: &RelPath, heading: &str) -> bool {
+        self.seen
+            .contains(&NodeId::Section(path.clone(), heading.to_string()))
+    }
+
     /// 全エッジへの参照（テストやグラフビューの描画に使う）。
     pub fn edges(&self) -> &[Edge] {
         &self.edges
@@ -295,6 +304,12 @@ pub enum ReferenceResolution {
     DocAmbiguous,
     /// 対応するドキュメントが存在しない。
     DocDangling,
+    /// ドキュメントは存在するが、指定した見出しが見つからない（見出し陳腐化）。
+    ///
+    /// `[[doc.md#heading]]` の `#heading` 部分が target doc の Section ノードに無い場合。
+    /// 見出しが削除・改名されたときに発生する。`path` はドキュメントへのリンクとして
+    /// 引き続き使える（ファイル自体は存在する）。
+    DocHeadingDangling { path: RelPath },
     /// コードシンボルが一意に解決できた。`id` で [`SymbolTable::get`] を引ける。
     CodeResolved { id: crate::model::SymbolId },
     /// 同名・同パスのシンボルが複数（C++ オーバーロード等）。
@@ -311,20 +326,31 @@ impl WorkspaceIndex {
     /// 解決ロジックが 1 か所に集約されるため、LSP・MCP・CLI で実装を重複させない。
     pub fn resolve_reference(&self, reference: &Reference) -> ReferenceResolution {
         match reference {
-            Reference::Doc { target, .. } => match target {
-                DocTarget::Path(p) => {
-                    if self.doc_paths.contains(&p.0) {
-                        ReferenceResolution::DocResolved(p.clone())
-                    } else {
-                        ReferenceResolution::DocDangling
+            Reference::Doc { target, heading } => {
+                // まず doc パス自体を解決する。
+                let path = match target {
+                    DocTarget::Path(p) => {
+                        if self.doc_paths.contains(&p.0) {
+                            p.clone()
+                        } else {
+                            return ReferenceResolution::DocDangling;
+                        }
+                    }
+                    DocTarget::Name(name) => match self.doc_by_stem.get(name.as_str()) {
+                        Some(Some(path)) => path.clone(),
+                        Some(None) => return ReferenceResolution::DocAmbiguous,
+                        None => return ReferenceResolution::DocDangling,
+                    },
+                };
+                // 見出し指定がある場合、Section ノードの存在を確認する（M6 陳腐化検出）。
+                // 厳密一致: 大文字・スペースの正規化は行わない。
+                if let Some(h) = heading {
+                    if !self.graph.has_section(&path, h) {
+                        return ReferenceResolution::DocHeadingDangling { path };
                     }
                 }
-                DocTarget::Name(name) => match self.doc_by_stem.get(name.as_str()) {
-                    Some(Some(path)) => ReferenceResolution::DocResolved(path.clone()),
-                    Some(None) => ReferenceResolution::DocAmbiguous,
-                    None => ReferenceResolution::DocDangling,
-                },
-            },
+                ReferenceResolution::DocResolved(path)
+            }
             Reference::Code(desc) => match self.symbols.resolve(desc) {
                 Resolution::Resolved { id, .. } => ReferenceResolution::CodeResolved { id },
                 Resolution::Ambiguous(ids) => ReferenceResolution::CodeAmbiguous(ids),
@@ -1061,6 +1087,58 @@ mod tests {
             resolve_doc_target(&DocTarget::Name("unknown".into()), &doc_paths, &stems),
             None
         );
+    }
+
+    // ----- resolve_reference（見出し照合 M6）-----
+
+    /// 観点: 見出し指定なしは DocResolved、存在する見出しは DocResolved、
+    ///       存在しない見出しは DocHeadingDangling を返す。
+    #[test]
+    fn resolve_reference_heading_staleness() {
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("dbrain_heading_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // "## 存在する見出し" を持つ doc を用意する。
+        fs::write(
+            dir.join("spec.md"),
+            "# spec\n\n## 存在する見出し\n\n本文。\n",
+        )
+        .unwrap();
+
+        let idx = index_workspace(&dir);
+
+        // 見出しなし → DocResolved。
+        let r = idx.resolve_reference(&Reference::Doc {
+            target: DocTarget::Path(RelPath("spec.md".into())),
+            heading: None,
+        });
+        assert!(
+            matches!(r, ReferenceResolution::DocResolved(_)),
+            "見出しなし→Resolved"
+        );
+
+        // 存在する見出し → DocResolved。
+        let r = idx.resolve_reference(&Reference::Doc {
+            target: DocTarget::Path(RelPath("spec.md".into())),
+            heading: Some("存在する見出し".into()),
+        });
+        assert!(
+            matches!(r, ReferenceResolution::DocResolved(_)),
+            "存在する見出し→Resolved"
+        );
+
+        // 存在しない見出し → DocHeadingDangling。
+        let r = idx.resolve_reference(&Reference::Doc {
+            target: DocTarget::Path(RelPath("spec.md".into())),
+            heading: Some("消えた見出し".into()),
+        });
+        assert!(
+            matches!(r, ReferenceResolution::DocHeadingDangling { .. }),
+            "存在しない見出し→HeadingDangling"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     // ----- to_rel / file_stem / symbol_label -----

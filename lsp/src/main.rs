@@ -347,6 +347,13 @@ impl LanguageServer for Backend {
         if let Some((reference, link_range)) = found {
             let text = match index.resolve_reference(&reference) {
                 ReferenceResolution::DocResolved(path) => format_doc_hover(&path, index),
+                // 見出しが消えていても doc の概要は表示する（ただし警告を添える）。
+                ReferenceResolution::DocHeadingDangling { path } => {
+                    format!(
+                        "⚠ 見出しが見つかりません\n\n{}",
+                        format_doc_hover(&path, index)
+                    )
+                }
                 ReferenceResolution::CodeResolved { id } => {
                     let Some(entry) = index.symbols.get(id) else {
                         return Ok(None);
@@ -776,6 +783,10 @@ fn compute_glossary_diagnostics(
 fn resolution_to_diagnostic(res: ReferenceResolution) -> Option<(String, DiagnosticSeverity)> {
     match res {
         ReferenceResolution::DocResolved(_) | ReferenceResolution::CodeResolved { .. } => None,
+        ReferenceResolution::DocHeadingDangling { .. } => Some((
+            "見出しが見つかりません（名前が変わったか削除されました）".to_string(),
+            DiagnosticSeverity::WARNING,
+        )),
         ReferenceResolution::DocAmbiguous => Some((
             "同名のドキュメントが複数あります。フルパスで指定してください".to_string(),
             DiagnosticSeverity::WARNING,
@@ -822,6 +833,10 @@ fn uri_to_rel_path(uri: &Url, root: &Path) -> Option<RelPath> {
 fn ref_to_uri(reference: &Reference, index: &WorkspaceIndex, root: &Path) -> Option<Url> {
     match index.resolve_reference(reference) {
         ReferenceResolution::DocResolved(path) => Url::from_file_path(root.join(&path.0)).ok(),
+        // 見出しが消えていても doc 自体へはリンクできる（クリックでファイルを開ける）。
+        ReferenceResolution::DocHeadingDangling { path } => {
+            Url::from_file_path(root.join(&path.0)).ok()
+        }
         ReferenceResolution::CodeResolved { id } => {
             let entry = index.symbols.get(id)?;
             Url::from_file_path(root.join(&entry.descriptor.file.0)).ok()
@@ -834,6 +849,14 @@ fn ref_to_uri(reference: &Reference, index: &WorkspaceIndex, root: &Path) -> Opt
 fn ref_to_location(reference: &Reference, index: &WorkspaceIndex, root: &Path) -> Option<Location> {
     match index.resolve_reference(reference) {
         ReferenceResolution::DocResolved(path) => {
+            let uri = Url::from_file_path(root.join(&path.0)).ok()?;
+            Some(Location {
+                uri,
+                range: Range::default(),
+            })
+        }
+        // 見出しが消えていても doc 先頭へジャンプする（何もしないより親切）。
+        ReferenceResolution::DocHeadingDangling { path } => {
             let uri = Url::from_file_path(root.join(&path.0)).ok()?;
             Some(Location {
                 uri,
