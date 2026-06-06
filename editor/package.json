@@ -30,7 +30,7 @@
   },
   "devDependencies": {
     "@types/cytoscape": "^3.31.0",
-    "@types/node": "^20.11.0",
+    "@types/node": "^25.9.2",
     "@types/vscode": "^1.85.0",
     "cytoscape": "^3.30.2",
     "esbuild": "^0.21.5",
