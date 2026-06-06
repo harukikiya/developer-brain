@@ -18,7 +18,7 @@ jobs:
     name: Rust (fmt / clippy / test)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -35,7 +35,7 @@ jobs:
     name: Docs (rustdoc 検証)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # Pages に公開するのと同じ内容を、警告ゼロで生成できるか確認する。
@@ -51,7 +51,7 @@ jobs:
       run:
         working-directory: editor
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
         with:
           node-version: 20
