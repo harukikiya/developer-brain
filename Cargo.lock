@@ -78,7 +78,7 @@ dependencies = [
 
 [[package]]
 name = "dbrain-cli"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "dbrain-core",
  "serde_json",
@@ -86,7 +86,7 @@ dependencies = [
 
 [[package]]
 name = "dbrain-core"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "pulldown-cmark",
  "serde",
@@ -99,7 +99,7 @@ dependencies = [
 
 [[package]]
 name = "dbrain-lsp"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "dbrain-core",
  "serde",
