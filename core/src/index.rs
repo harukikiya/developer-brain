@@ -491,7 +491,8 @@ impl Glossary {
             .collect();
         // 長い表層形を先に試すことで最長一致を実現する
         // （"状態遷移" を "状態" より優先）。
-        patterns.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        // Reverse で降順にする（大きい方が先）。
+        patterns.sort_by_key(|(pat, _)| std::cmp::Reverse(pat.len()));
         Glossary { terms, patterns }
     }
 
