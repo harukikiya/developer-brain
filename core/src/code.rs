@@ -27,7 +27,7 @@ struct Frame {
 /// Rust ソースから定義シンボルを抽出する **純粋関数**（ファイルに触れない）。
 pub fn extract_rust_symbols(file: &RelPath, source: &str) -> Vec<SymbolEntry> {
     let mut parser = Parser::new();
-    if parser.set_language(tree_sitter_rust::language()).is_err() {
+    if parser.set_language(&tree_sitter_rust::language()).is_err() {
         return Vec::new();
     }
     let tree = match parser.parse(source, None) {
@@ -351,7 +351,7 @@ fn ext_of(path: &str) -> Option<&str> {
 /// C ソースから定義シンボルを抽出する純粋関数。
 pub fn extract_c_symbols(file: &RelPath, source: &str) -> Vec<SymbolEntry> {
     let mut parser = Parser::new();
-    if parser.set_language(tree_sitter_c::language()).is_err() {
+    if parser.set_language(&tree_sitter_c::language()).is_err() {
         return Vec::new();
     }
     let tree = match parser.parse(source, None) {

@@ -34,7 +34,7 @@
     "@types/vscode": "^1.85.0",
     "cytoscape": "^3.30.2",
     "esbuild": "^0.28.0",
-    "typescript": "^5.4.5"
+    "typescript": "^6.0.3"
   },
   "dependencies": {
     "vscode-languageclient": "^9.0.1"

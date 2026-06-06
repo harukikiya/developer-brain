@@ -41,7 +41,9 @@ pub struct ParsedDoc {
 /// （コード例の中の文字列を誤ってリンク扱いしないため）。判定には
 /// pulldown-cmark が返すコード範囲（バイトオフセット）を使う。
 pub fn index_document(content: &str) -> ParsedDoc {
-    use pulldown_cmark::{Event, Parser, Tag};
+    // pulldown-cmark 0.13 で Tag::Heading が構造体バリアントに、
+    // Event::End が TagEnd を取るように変わった。
+    use pulldown_cmark::{Event, Parser, Tag, TagEnd};
 
     // YAML フロントマター（先頭の `---` 〜 `---`）は本文ではないので先に除く。
     // pulldown-cmark はフロントマターを知らず、`---` を見出し下線などと
@@ -57,11 +59,11 @@ pub fn index_document(content: &str) -> ParsedDoc {
     // into_offset_iter は (イベント, ソース上のバイト範囲) を返す。
     for (event, range) in Parser::new(body).into_offset_iter() {
         match event {
-            Event::Start(Tag::Heading(..)) => {
+            Event::Start(Tag::Heading { .. }) => {
                 in_heading = true;
                 heading_buf.clear();
             }
-            Event::End(Tag::Heading(..)) => {
+            Event::End(TagEnd::Heading(_)) => {
                 in_heading = false;
                 let h = heading_buf.trim().to_string();
                 if !h.is_empty() {
@@ -72,7 +74,7 @@ pub fn index_document(content: &str) -> ParsedDoc {
             Event::Text(t) if in_heading => heading_buf.push_str(&t),
             // フェンス付きコードブロックは Start〜End の範囲を丸ごと除外対象に。
             Event::Start(Tag::CodeBlock(_)) => codeblock_start = Some(range.start),
-            Event::End(Tag::CodeBlock(_)) => {
+            Event::End(TagEnd::CodeBlock) => {
                 if let Some(s) = codeblock_start.take() {
                     code_ranges.push(s..range.end);
                 }
@@ -431,14 +433,14 @@ fn byte_offset_to_position(text: &str, byte_offset: usize) -> model::Position {
 /// `[[...]]` リンクや用語の出現を、コード例の中で誤検出しないための除外範囲。
 /// [`parse_links_with_ranges`] と [`find_term_mentions`] が共有する。
 fn collect_code_ranges(body: &str) -> Vec<Range<usize>> {
-    use pulldown_cmark::{Event, Parser, Tag};
+    use pulldown_cmark::{Event, Parser, Tag, TagEnd};
 
     let mut ranges: Vec<Range<usize>> = Vec::new();
     let mut codeblock_start: Option<usize> = None;
     for (event, range) in Parser::new(body).into_offset_iter() {
         match event {
             Event::Start(Tag::CodeBlock(_)) => codeblock_start = Some(range.start),
-            Event::End(Tag::CodeBlock(_)) => {
+            Event::End(TagEnd::CodeBlock) => {
                 if let Some(s) = codeblock_start.take() {
                     ranges.push(s..range.end);
                 }
