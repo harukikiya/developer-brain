@@ -2,7 +2,7 @@
   "name": "developer-brain",
   "displayName": "Developer Brain",
   "description": "Code-aware knowledge graph for VS Code (Rust core).",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "publisher": "developer-brain",
   "license": "MIT",
   "engines": {
