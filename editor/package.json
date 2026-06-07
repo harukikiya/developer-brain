@@ -32,7 +32,7 @@
     "@types/cytoscape": "^3.31.0",
     "@types/node": "^25.9.2",
     "@types/vscode": "^1.85.0",
-    "cytoscape": "^3.30.2",
+    "cytoscape": "^3.34.0",
     "esbuild": "^0.28.0",
     "typescript": "^6.0.3"
   },
